@@ -1,0 +1,3 @@
+[submodule "submodules/deepscm"]
+	path = submodules/deepscm
+	url = git@github.com:biomedia-mira/deepscm.git
