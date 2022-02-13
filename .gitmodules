@@ -1,3 +1,9 @@
 [submodule "submodules/deepscm"]
 	path = submodules/deepscm
 	url = git@github.com:biomedia-mira/deepscm.git
+[submodule "submodules/PyTorch-VAE"]
+	path = submodules/PyTorch-VAE
+	url = git@github.com:AntixK/PyTorch-VAE.git
+[submodule "submodules/pytorch-vqvae"]
+	path = submodules/pytorch-vqvae
+	url = git@github.com:ritheshkumar95/pytorch-vqvae.git
