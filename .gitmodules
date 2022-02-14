@@ -7,3 +7,6 @@
 [submodule "submodules/pytorch-vqvae"]
 	path = submodules/pytorch-vqvae
 	url = git@github.com:ritheshkumar95/pytorch-vqvae.git
+[submodule "submodules/Morpho-MNIST"]
+	path = submodules/Morpho-MNIST
+	url = git@github.com:dccastro/Morpho-MNIST.git

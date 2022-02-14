@@ -5,12 +5,14 @@ import torch.nn.functional as F
 
 
 class VQVAE(pl.LightningModule):
-    """Wrapper of VQ-VAE in https://github.com/ritheshkumar95/pytorch-vqvae"""
+    """Wrapper of VQ-VAE in https://github.com/ritheshkumar95/pytorch-vqvae
+    Hyperparameters as in https://github.com/praeclarumjj3/VQ-VAE-on-MNIST
+    """
 
     def __init__(
         self,
-        in_channels: int,
-        codebook_size: int = 512,         # K
+        in_channels: int = 1,
+        codebook_size: int = 32,          # K
         latent_dim: int = 256,            # dimension of z
         commit_loss_weight: float = 1.0,  # beta
         lr: float = 2e-4,
@@ -25,8 +27,12 @@ class VQVAE(pl.LightningModule):
     def forward(self, x):
         return self.model.forward(x)
 
+    def _prep_batch(self, batch):
+        x = batch['image']
+        return x
+
     def _step(self, batch):
-        x = batch
+        x = self._prep_batch(batch)
         x_tilde, z_e_x, z_q_x = self.model(x)
 
         # reconstruction loss
@@ -46,7 +52,7 @@ class VQVAE(pl.LightningModule):
         }
 
         return loss, metrics
-    
+
     def training_step(self, batch, _batch_idx):
         loss, _metrics = self._step(batch)
         return loss

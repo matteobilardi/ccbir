@@ -26,7 +26,7 @@ class MNISTDummyVAE(pl_bolts.models.VAE):
     def _prep_batch(self, batch):
         # Remove all morphometrics, keeping only the image, and convert to RGB
         #X = batch['image'].unsqueeze(1).repeat(1, 3, 1, 1).float()
-        X = batch['image'].unsqueeze(1).float()
+        X = batch['image']
         y = None  # self-supervised setting so label
         return X, y
 
