@@ -1,4 +1,3 @@
-
 from ccbir.configuration import config
 from deepscm.datasets.morphomnist import MorphoMNISTLike
 from pathlib import Path
@@ -28,16 +27,16 @@ class MorphoMNISTLikeDataModule(pl.LightningDataModule):
         self.pin_memory = pin_memory
 
     def prepare_data(self):
-        # check that data lives on disk, raise exception otherwise
+        # check that data directory lives on disk, raise exception otherwise
         Path(self.data_dir).resolve(strict=True)
 
-    def _normalize(self, image: Tensor) -> Tensor:
+    def normalize(self, image: Tensor) -> Tensor:
         assert hasattr(self, '_normalize_transform')
         return self._normalize_transform(image)
 
     # TODO: if we never need to unnormalize, the dependency on invertransform
     # could be avoided
-    def _unnormalize(self, image: Tensor) -> Tensor:
+    def unnormalize(self, image: Tensor) -> Tensor:
         assert hasattr(self, '_normalize_transform')
         return self._normalize_transform.invert(image)
 
@@ -90,11 +89,11 @@ class MorphoMNISTLikeDataModule(pl.LightningDataModule):
             ),
             # enforce range [-1, 1] in line with tanh NN output
             # see https://discuss.pytorch.org/t/understanding-transform-normalize/21730/2
-            T.Normalize(0.5, 0.5)
+            T.Normalize(mean=0.5, std=0.5)
         ])
 
-        mnist_train.images = self._normalize(mnist_train.images)
-        self.mnist_test.images = self._normalize(self.mnist_test.images)
+        mnist_train.images = self.normalize(mnist_train.images)
+        self.mnist_test.images = self.normalize(self.mnist_test.images)
 
         # Reserve split for validation
         num_val = len(mnist_train) // 10

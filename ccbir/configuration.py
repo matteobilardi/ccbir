@@ -28,7 +28,8 @@ class Config:
         paths = [
             self.project_root,
             self.project_root / 'ccbir',
-            self.project_root / 'ccbir/pytorch_vqvae',
+            self.project_root / 'ccbir/pytorch_vqvae',  # TODO: avoid copy-paste
+            self._submodules_path / 'deepscm',
         ]
         sys.path.extend(str(p) for p in paths)
 
