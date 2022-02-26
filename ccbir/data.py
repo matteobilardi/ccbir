@@ -1,13 +1,294 @@
+from __future__ import annotations
+
 from ccbir.configuration import config
+from deepscm.datasets import morphomnist
 from deepscm.datasets.morphomnist import MorphoMNISTLike
 from pathlib import Path
 from torch import Tensor
 from torch.utils.data import DataLoader, random_split
-from typing import Optional
+from typing import Callable, List, Optional, Tuple
 import multiprocessing
 import pytorch_lightning as pl
 import torchvision
-import invertransforms as T
+import invertransforms
+from torch.utils.data import Dataset
+
+from typing import Type, Union
+from deepscm.morphomnist.morpho import ImageMorphology
+from deepscm.morphomnist.perturb import Fracture, Perturbation, Swelling
+import numpy as np
+from functools import partial
+import pandas as pd
+import tqdm
+
+from configuration import config
+
+# As per generate_all script in morphomnist
+THRESHOLD = .5
+UP_FACTOR = 4
+
+
+# TODO: not sure if the whole concept of a perturbation sampler and of saving to
+# file the perturbation args makes sense. Might wanna remove if I conclusively
+# establish that it is not needed
+class PerturbationSampler:
+    def __init__(self, perturbation_type: Type[Perturbation]):
+        self.perturbation_type = perturbation_type
+
+    def sample_args(self, num_samples) -> pd.DataFrame:
+        raise NotImplementedError()
+
+    def sample(self, num_samples):
+        perturbations_args = self.sample_args(num_samples)
+        perturbations = [
+            # note that in generaral perturbation type constructors are
+            # stochastic so that perturbations initialised with the same
+            # arguments need not produce identical outputs
+            self.perturbation_type(**kwargs)
+            for kwargs in perturbations_args.to_dict(orient='records')
+        ]
+
+        return perturbations, perturbations_args
+
+
+class SwellingSampler(PerturbationSampler):
+    def __init__(self):
+        super().__init__(Swelling)
+
+    def sample_args(self, num_samples) -> pd.DataFrame:
+        # TODO: for now we don't actually sample the arguments and instead rely
+        # on the swelling location sampling internal to the Swelling class and
+        # apply a Swelling initialised with the same arguments to all images.
+        # Also, for now we don't pass such arguments to the twin network as they
+        # are constant. And the treatment is instead a one-hot encoding of an
+        # enum: either swelling fracture or no-treatment (i.e. identity
+        # function)
+        strength = np.full((num_samples,), 3.0)
+        radius = np.full((num_samples,), 7.0)
+
+        return pd.DataFrame.from_dict(dict(
+            strength=strength,
+            radius=radius,
+        ))
+
+
+class FractureSampler(PerturbationSampler):
+    def __init__(self):
+        super().__init__(Fracture)
+
+    def sample_args(self, num_samples) -> pd.DataFrame:
+        # TODO: see TODO in same location for SwellingSampler
+        thickness = np.full((num_samples,), 1.5, dtype=float)
+        prune = np.full((num_samples,), 2.0, dtype=float)
+        num_frac = np.full((num_samples,), 3, dtype=int)
+
+        return pd.DataFrame.from_dict(dict(
+            thickness=thickness,
+            prune=prune,
+            num_frac=num_frac,
+        ))
+
+
+class PerturbedMorphoMNIST(Dataset):
+    """ MorphoMNIST dataset after perturbations of a (single) given
+    perturbation_type initilised with arguments obtained by sampling from the
+    given stochastic model. """
+
+    def __init__(
+        self,
+        perturbation_type: Type[Perturbation],
+        data_dir: str = str(config.project_data_path),
+        original_data_dir: str = str(config.original_mnist_data_path),
+        *,
+        train: bool,
+        perturbation_sampler: Optional[PerturbationSampler] = None,
+        transform: Optional[Callable] = None,
+        overwrite: bool = False,
+    ):
+        super().__init__()
+        self.perturbation_type = perturbation_type
+        self.data_path = Path(data_dir).resolve(strict=True)
+        self.original_data_dir = original_data_dir
+        self.train = train
+        self.transform = transform
+
+        # Create folder for this dataset (if it does not exist already)
+        self.dataset_path = self.data_path / self.perturbation_name
+        self.dataset_path.mkdir(parents=True, exist_ok=True)
+
+        # Set dataset paths
+        prefix = "train" if self.train else "t10k"
+        self.images_path = self.dataset_path / f"{prefix}-images-idx3-ubyte.gz"
+        self.perturbations_args_path = \
+            self.dataset_path / f"{prefix}-perturbations-args.csv"
+
+        # Load dataset or generate it if it does not exits
+        exists = self.images_path.exists() and self.dataset_path.exists()
+        if exists and not overwrite:
+            self._load_dataset()
+        elif perturbation_sampler is None:
+            raise ValueError(f"""
+                perturbation_sampler cannot be None when the dataset does not
+                exist already in {data_dir=} or when overwrite=True
+            """)
+        elif not issubclass(
+            perturbation_sampler.perturbation_type,
+            perturbation_type
+        ):
+            raise TypeError(f"""
+                {perturbation_sampler.perturbation_type=} is not a subclass
+                of {perturbation_type=}
+            """)
+        else:
+            print(f"Generating dataset for perturbation {perturbation_type}")
+            self._generate_dataset(perturbation_sampler)
+
+    @property
+    def perturbation_name(self) -> str:
+        return str(self.perturbation_type.__name__).lower()
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, index):
+        image = self.images[index]
+        if self.transform is not None:
+            image = self.transform(image)
+
+        perturbation_kwargs = self.perturbations_args.iloc[index].to_dict()
+
+        return dict(image=image, perturbation_args=perturbation_kwargs)
+
+    def _perturb_image(
+        self,
+        perturbation_and_image: Tuple[Perturbation, np.ndarray]
+    ):
+        perturbation, image = perturbation_and_image
+        morph = ImageMorphology(image, THRESHOLD, UP_FACTOR)
+        perturbed_image = morph.downscale(perturbation(morph))
+
+        return perturbed_image
+
+    def _load_dataset(self):
+        self.images = morphomnist.io.load_idx(str(self.images_path))
+        self.perturbations_args = pd.read_csv(self.perturbations_args_path)
+        assert len(self.images) == len(self.perturbations_args)
+
+    def _generate_dataset(
+        self,
+        perturbation_sampler: PerturbationSampler,
+        persist: bool = True
+    ):
+        original_dataset = \
+            MorphoMNISTLike(self.original_data_dir, train=self.train)
+        images = original_dataset.images
+        perturbations, perturbations_args =  \
+            perturbation_sampler.sample(len(images))
+
+        with multiprocessing.Pool() as pool:
+            perturbed_images_gen = pool.imap(
+                self._perturb_image,
+                zip(perturbations, images),
+                chunksize=128
+            )
+
+            # dispaly progress bar (technically not up to date because generator
+            # blocks for correct result order)
+            perturbed_images_gen = tqdm.tqdm(
+                perturbed_images_gen,
+                total=len(images),
+                unit='img',
+                ascii=True
+            )
+
+            perturbed_images = np.stack(list(perturbed_images_gen))
+
+        if persist:
+            morphomnist.io.save_idx(perturbed_images, str(self.images_path))
+            perturbations_args.to_csv(self.perturbations_args_path)
+
+        self.images = perturbed_images
+        self.perturbations_args = perturbations_args
+
+
+class SwelledMorphoMNIST(PerturbedMorphoMNIST):
+    def __init__(
+        self,
+        *args,
+        swelling_sampler: PerturbationSampler = SwellingSampler(),
+        **kwargs,
+
+    ):
+        super().__init__(
+            *args,
+            **kwargs,
+            perturbation_type=Swelling,
+            perturbation_sampler=swelling_sampler,
+        )
+
+
+class FracturedMorphoMNIST(PerturbedMorphoMNIST):
+    def __init__(
+        self,
+        *args,
+        fracture_sampler: PerturbationSampler = FractureSampler(),
+        **kwargs
+    ):
+        super().__init__(
+            *args,
+            **kwargs,
+            perturbation_type=Fracture,
+            perturbation_sampler=fracture_sampler,
+        )
+
+
+"""
+class TONAME_PROBABLY_IN_EXPRIMENT_SECTION(Dataset):
+    def __init__(
+        self,
+        data_dir: str,
+        transform: Optional[Callable] = None,
+    ):
+        super().__init__()
+        self.transform = self.transform
+
+        # TODO: load from disk and apply transform
+        ...
+
+    @classmethod
+    def generate(
+        cls,
+        data_dir: str,
+        perturbations: List[SerializablePerturbation],
+    ):
+        ...
+
+    def __len__(self):
+        ...
+
+    def __getitem__(self, idx):
+        perturbations = {
+            'swelling': {
+                'image': ...,
+                # TODO: Probably data about the kind of swelling applied
+            },
+            'fracture': {
+                'image': ...,
+                # TODO: probably data about the kind of fracture applied
+
+            }
+        }
+
+        original = {
+            'original': {
+                'image': ...,
+                'label': ...,
+                'metrics': ...,
+            },
+        }
+
+        return {**original, **perturbations}
+"""
 
 
 class MorphoMNISTLikeDataModule(pl.LightningDataModule):
@@ -80,16 +361,16 @@ class MorphoMNISTLikeDataModule(pl.LightningDataModule):
             self.data_dir, train=False, columns=columns
         )
 
-        self._normalize_transform = T.Compose([
+        self._normalize_transform = invertransforms.Compose([
             # insert explicit gray channel and convert to float in range [0,1]
             # as typical for pytorch images
-            T.Lambda(
+            invertransforms.Lambda(
                 lambd=lambda image: image.unsqueeze(1).float() / 255.0,
                 tf_inv=lambda image: (image * 255.0).byte().squeeze(1)
             ),
             # enforce range [-1, 1] in line with tanh NN output
             # see https://discuss.pytorch.org/t/understanding-transform-normalize/21730/2
-            T.Normalize(mean=0.5, std=0.5)
+            invertransforms.Normalize(mean=0.5, std=0.5)
         ])
 
         mnist_train.images = self.normalize(mnist_train.images)

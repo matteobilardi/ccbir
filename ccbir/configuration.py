@@ -8,6 +8,10 @@ class Config:
         return Path(__file__).parent.parent.resolve(strict=True)
 
     @property
+    def project_data_path(self) -> Path:
+        return self.project_root / 'assets/data'
+
+    @property
     def original_mnist_data_path(self) -> Path:
         # TODO: find a better, sensible way to keep track of all of the data and
         # project directories, e.g. read object starting from yaml config
