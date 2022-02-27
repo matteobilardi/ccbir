@@ -1,8 +1,10 @@
 from __future__ import annotations
+from sys import prefix
 
 from ccbir.configuration import config
 from deepscm.datasets import morphomnist
-from deepscm.datasets.morphomnist import MorphoMNISTLike
+import deepscm
+from deepscm.datasets.morphomnist import MorphoMNISTLike, _get_paths, save_morphomnist_like
 from pathlib import Path
 from torch import Tensor
 from torch.utils.data import DataLoader, random_split
@@ -12,6 +14,7 @@ import pytorch_lightning as pl
 import torchvision
 import invertransforms
 from torch.utils.data import Dataset
+import PIL
 
 from typing import Type, Union
 from deepscm.morphomnist.morpho import ImageMorphology
@@ -20,6 +23,7 @@ import numpy as np
 from functools import partial
 import pandas as pd
 import tqdm
+import torchvision
 
 from configuration import config
 
@@ -35,10 +39,13 @@ class PerturbationSampler:
     def __init__(self, perturbation_type: Type[Perturbation]):
         self.perturbation_type = perturbation_type
 
-    def sample_args(self, num_samples) -> pd.DataFrame:
+    def sample_args(self, num_samples: int) -> pd.DataFrame:
         raise NotImplementedError()
 
-    def sample(self, num_samples):
+    def sample(
+        self,
+        num_samples: int
+    ) -> Tuple[List[Perturbation], pd.DataFrame]:
         perturbations_args = self.sample_args(num_samples)
         perturbations = [
             # note that in generaral perturbation type constructors are
@@ -55,7 +62,7 @@ class SwellingSampler(PerturbationSampler):
     def __init__(self):
         super().__init__(Swelling)
 
-    def sample_args(self, num_samples) -> pd.DataFrame:
+    def sample_args(self, num_samples: int) -> pd.DataFrame:
         # TODO: for now we don't actually sample the arguments and instead rely
         # on the swelling location sampling internal to the Swelling class and
         # apply a Swelling initialised with the same arguments to all images.
@@ -89,49 +96,19 @@ class FractureSampler(PerturbationSampler):
         ))
 
 
-class PerturbedMorphoMNIST(Dataset):
-    """ MorphoMNIST dataset after perturbations of a (single) given
+class PerturbedMorphoMNISTGenerator:
+    """ Generate MorphoMNIST dataset after perturbations of a (single) given
     perturbation_type initilised with arguments obtained by sampling from the
-    given stochastic model. """
+    given perturbation_sampler and applied to the original MNIST dataset. """
 
     def __init__(
         self,
         perturbation_type: Type[Perturbation],
-        data_dir: str = str(config.project_data_path),
+        perturbation_sampler: PerturbationSampler,
         original_data_dir: str = str(config.original_mnist_data_path),
-        *,
-        train: bool,
-        perturbation_sampler: Optional[PerturbationSampler] = None,
-        transform: Optional[Callable] = None,
-        overwrite: bool = False,
     ):
-        super().__init__()
-        self.perturbation_type = perturbation_type
-        self.data_path = Path(data_dir).resolve(strict=True)
-        self.original_data_dir = original_data_dir
-        self.train = train
-        self.transform = transform
 
-        # Create folder for this dataset (if it does not exist already)
-        self.dataset_path = self.data_path / self.perturbation_name
-        self.dataset_path.mkdir(parents=True, exist_ok=True)
-
-        # Set dataset paths
-        prefix = "train" if self.train else "t10k"
-        self.images_path = self.dataset_path / f"{prefix}-images-idx3-ubyte.gz"
-        self.perturbations_args_path = \
-            self.dataset_path / f"{prefix}-perturbations-args.csv"
-
-        # Load dataset or generate it if it does not exits
-        exists = self.images_path.exists() and self.dataset_path.exists()
-        if exists and not overwrite:
-            self._load_dataset()
-        elif perturbation_sampler is None:
-            raise ValueError(f"""
-                perturbation_sampler cannot be None when the dataset does not
-                exist already in {data_dir=} or when overwrite=True
-            """)
-        elif not issubclass(
+        if not issubclass(
             perturbation_sampler.perturbation_type,
             perturbation_type
         ):
@@ -139,25 +116,10 @@ class PerturbedMorphoMNIST(Dataset):
                 {perturbation_sampler.perturbation_type=} is not a subclass
                 of {perturbation_type=}
             """)
-        else:
-            print(f"Generating dataset for perturbation {perturbation_type}")
-            self._generate_dataset(perturbation_sampler)
 
-    @property
-    def perturbation_name(self) -> str:
-        return str(self.perturbation_type.__name__).lower()
-
-    def __len__(self):
-        return len(self.images)
-
-    def __getitem__(self, index):
-        image = self.images[index]
-        if self.transform is not None:
-            image = self.transform(image)
-
-        perturbation_kwargs = self.perturbations_args.iloc[index].to_dict()
-
-        return dict(image=image, perturbation_args=perturbation_kwargs)
+        self.perturbation_type = perturbation_type
+        self.perturbation_sampler = perturbation_sampler
+        self.original_data_dir = original_data_dir
 
     def _perturb_image(
         self,
@@ -169,26 +131,21 @@ class PerturbedMorphoMNIST(Dataset):
 
         return perturbed_image
 
-    def _load_dataset(self):
-        self.images = morphomnist.io.load_idx(str(self.images_path))
-        self.perturbations_args = pd.read_csv(self.perturbations_args_path)
-        assert len(self.images) == len(self.perturbations_args)
-
-    def _generate_dataset(
+    def generate_dataset(
         self,
-        perturbation_sampler: PerturbationSampler,
-        persist: bool = True
+        out_dir: str,
+        *,
+        train: bool,
     ):
-        original_dataset = \
-            MorphoMNISTLike(self.original_data_dir, train=self.train)
-        images = original_dataset.images
+        original_dataset = MorphoMNISTLike(self.original_data_dir, train=train)
+        original_images = original_dataset.images
         perturbations, perturbations_args =  \
-            perturbation_sampler.sample(len(images))
+            self.perturbation_sampler.sample(len(original_images))
 
         with multiprocessing.Pool() as pool:
             perturbed_images_gen = pool.imap(
                 self._perturb_image,
-                zip(perturbations, images),
+                zip(perturbations, original_images),
                 chunksize=128
             )
 
@@ -196,50 +153,178 @@ class PerturbedMorphoMNIST(Dataset):
             # blocks for correct result order)
             perturbed_images_gen = tqdm.tqdm(
                 perturbed_images_gen,
-                total=len(images),
+                total=len(original_images),
                 unit='img',
                 ascii=True
             )
 
             perturbed_images = np.stack(list(perturbed_images_gen))
 
-        if persist:
-            morphomnist.io.save_idx(perturbed_images, str(self.images_path))
-            perturbations_args.to_csv(self.perturbations_args_path)
+        out_path = Path(out_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
 
-        self.images = perturbed_images
-        self.perturbations_args = perturbations_args
+        perturbations_args_path = \
+            PerturbedMorphoMNIST.get_perturbations_args_path(out_path, train)
+
+        # TODO? For now no need to compute metrics for perturbed images
+        # but might become necessary in the future
+        dummy_empty_metrics = pd.DataFrame(index=range(len(perturbed_images)))
+        save_morphomnist_like(
+            images=perturbed_images,
+            labels=original_dataset.labels,
+            metrics=dummy_empty_metrics,
+            root_dir=out_dir,
+            train=train,
+        )
+
+        perturbations_args.to_csv(perturbations_args_path)
+
+        return perturbed_images, perturbations_args
 
 
-class SwelledMorphoMNIST(PerturbedMorphoMNIST):
+# TODO: for now just subclass and hotfix deepscm MorphoMNISTLike for consistency
+# with torchvision, ideally might want to write own logic avoid hacky use of
+# multiple inheritance
+class MorphoMNIST(MorphoMNISTLike, torchvision.datasets.VisionDataset):
     def __init__(
         self,
-        *args,
-        swelling_sampler: PerturbationSampler = SwellingSampler(),
-        **kwargs,
-
+        data_dir: str,
+        train: bool,
+        *,
+        transform: Optional[Callable] = None,
+        metrics: Optional[List[str]] = None,  # None fetches all metrics
     ):
-        super().__init__(
-            *args,
-            **kwargs,
-            perturbation_type=Swelling,
-            perturbation_sampler=swelling_sampler,
+        torchvision.datasets.VisionDataset.__init__(
+            self,
+            root=data_dir,
+            transform=transform,
         )
+
+        MorphoMNISTLike.__init__(
+            self,
+            root_dir=data_dir,
+            train=train,
+            columns=metrics
+        )
+
+    def __getitem__(self, index):
+        item = MorphoMNISTLike.__getitem__(self, index)
+        image_tensor = item['image']
+        # enforce consistent format with all other tochvision datasets
+        image = PIL.Image.fromarray(image_tensor.numpy(), mode='L')
+
+        if self.transform is not None:
+            image = self.transform(image)
+
+        item['image'] = image
+
+        return item
+
+    @staticmethod
+    def get_images_path(data_path: Path, train: bool):
+        prefix = "train" if train else "t10k"
+        return data_path / f"{prefix}-images-idx3-ubyte.gz"
+
+    @staticmethod
+    def get_labels_path(data_path: Path, train: bool):
+        prefix = "train" if train else "t10k"
+        return data_path / f"{prefix}-labels-idx1-ubyte.gz"
+
+    @staticmethod
+    def get_morpho_path(data_path: Path, train: bool):
+        prefix = "train" if train else "t10k"
+        return data_path / f"{prefix}-morpho.csv"
+
+
+class PlainMorphoMNIST(MorphoMNIST):
+    def __init__(
+        self,
+        data_dir: str = str(config.plain_morphomnist_data_path),
+        **kwargs,
+    ):
+        super().__init__(data_dir=data_dir, **kwargs)
+
+
+class PerturbedMorphoMNIST(MorphoMNIST):
+    """ MorphoMNIST dataset on which perturbations of the single
+    perturbation_type have been performed.
+
+    If the database doesn't already exist at the given data_dir, a dataset
+    generator must be given.
+    """
+
+    def __init__(
+        self,
+        perturbation_type: Type[Perturbation],
+        data_dir: Optional[str] = None,
+        generator: Optional[PerturbedMorphoMNISTGenerator] = None,
+        *,
+        train: bool,
+        overwrite: bool = False,
+        **kwargs,
+    ):
+        self.perturbation_type = perturbation_type
+        self.train = train
+
+        if data_dir is None:
+            self.data_path = config.project_data_path / self.perturbation_name
+        else:
+            self.data_path = Path(data_dir).resolve(strict=True)
+
+        images_path = self.__class__.get_images_path(self.data_path, train)
+        perturbations_args_path = \
+            self.__class__.get_perturbations_args_path(self.data_path, train)
+
+        # Load dataset or generate it if it does not exits
+        exists = images_path.exists() and perturbations_args_path.exists()
+        if exists and not overwrite:
+            self.perturbations_args = pd.read_csv(perturbations_args_path)
+        elif generator is None:
+            raise ValueError(
+                f"generator cannot be None when the dataset does not exist"
+                f"already in {data_dir=} or when overwrite=True"
+            )
+        else:
+            dataset_type = 'train' if train else 'test'
+            print(
+                f"Generating {dataset_type} dataset for perturbation"
+                f"{perturbation_type}"
+            )
+
+            _images, self.perturbations_args = generator.generate_dataset(
+                out_dir=str(self.data_path),
+                train=train,
+            )
+
+        super().__init__(data_dir=str(self.data_path), train=train, **kwargs)
+
+    @staticmethod
+    def get_perturbations_args_path(data_path: Path, train: bool) -> Path:
+        prefix = "train" if train else "t10k"
+        return data_path / f"{prefix}-perturbations-args.csv"
+
+    @property
+    def perturbation_name(self) -> str:
+        return str(self.perturbation_type.__name__).lower()
+
+    def __getitem__(self, index):
+        item = super().__getitem__(index)
+        item['perturbations_args'] = \
+            self.perturbations_args.iloc[index].to_dict()
+
+        return item
+
+
+class SwollenMorphoMNIST(PerturbedMorphoMNIST):
+    def __init__(self, **kwargs):
+        generator = PerturbedMorphoMNISTGenerator(Swelling, SwellingSampler())
+        super().__init__(Swelling, **kwargs, generator=generator)
 
 
 class FracturedMorphoMNIST(PerturbedMorphoMNIST):
-    def __init__(
-        self,
-        *args,
-        fracture_sampler: PerturbationSampler = FractureSampler(),
-        **kwargs
-    ):
-        super().__init__(
-            *args,
-            **kwargs,
-            perturbation_type=Fracture,
-            perturbation_sampler=fracture_sampler,
-        )
+    def __init__(self, **kwargs):
+        generator = PerturbedMorphoMNISTGenerator(Fracture, FractureSampler())
+        super().__init__(Fracture, **kwargs, generator=generator)
 
 
 """
@@ -291,10 +376,12 @@ class TONAME_PROBABLY_IN_EXPRIMENT_SECTION(Dataset):
 """
 
 
+# TODO: rename to be used with VAE and probably rerun training
+# with dataset shwoing local perturbations (swelling + deformations)
 class MorphoMNISTLikeDataModule(pl.LightningDataModule):
     def __init__(
         self,
-        data_dir: str = str(config.synth_mnist_data_path),
+        data_dir: str = str(config.local_morphomnist_data_path),
         num_workers: int = multiprocessing.cpu_count(),
         train_batch_size: int = 64,
         test_batch_size: int = 64,
