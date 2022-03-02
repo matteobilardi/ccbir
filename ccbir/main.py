@@ -1,9 +1,42 @@
 from configuration import config
 config.pythonpath_fix()
 from ccbir.models.vqvae import VQVAE
-from ccbir.data import MorphoMNISTLikeDataModule
-from ccbir.models.dummy_vae import MNISTDummyVAE
 
+class CBIRDatabase:
+    def __init__(
+        self,
+        extract_feature_vector: Callable[[Tensor], Tensor],
+    ):
+        pass
+
+    def insert(image):
+        pass
+
+    def find_closest_images(img_feature_vector, top_k):
+        pass
+
+class PlainSwollenFracturedCCBIR:
+    def __init__(
+        self,
+        encode: Callable[[Tensor], Tensor],
+        decode: Callable[[Tensor], Tensor],
+        database: CBIRDatabase,
+    ) -> None:
+        pass
+
+    def counterfactual_fractured_img(
+        original_img_info: dict,
+        swollen_img: Tensor,
+    ):
+        swollen_fv = self.encode(swollen_img)
+
+        pass
+
+    def retrieve_counterfactual_fractured(
+        original_img_info,
+        swollen_img,
+    ):
+        pass
 
 def main():
     from pytorch_lightning.utilities.cli import LightningCLI

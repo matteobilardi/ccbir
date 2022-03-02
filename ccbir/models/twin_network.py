@@ -1,39 +1,67 @@
-import enum
-from turtle import forward
-from typing import Callable, Dict, Mapping, Tuple
-import pytorch_lightning as pl
-from torch import Tensor, nn
-from torch.distributions import Distribution
+from ccbir.configuration import config
+config.pythonpath_fix()
+from sklearn import metrics
 import torch.nn.functional as F
 import torch
+import pytorch_lightning as pl
+from typing import Callable, Dict, Mapping, Optional, Tuple
+from torchvision import transforms
+from torch.distributions import Distribution
+from torch import Tensor, embedding, nn
+from functools import partial
+from ccbir.models.vqvae import VQVAE
+from ccbir.models.model import load_best_model
+from ccbir.data.morphomnist.dataset import FracturedMorphoMNIST, PlainMorphoMNIST, SwollenMorphoMNIST
+from ccbir.data.morphomnist.datamodule import MorphoMNISTDataModule
+from ccbir.data.dataset import CombinedDataset
 
 
-class BaseSimpleTwinNet(nn.Module):
+class DeepSimpleTwinNet(nn.Module):
     """Twin network for DAG: X -> Y <- Z that allows sampling from
     P(Y, Y* | X, X*, Z)"""
 
-    def __init__(self):
-        super().__init__()
-
-    def forward(
-        factual_treatment: Tensor,
-        counterfactual_treatment: Tensor,
-        confounders: Tensor,
-        outcome_noise: Tensor,
-    ) -> Tuple[Tensor, Tensor]:
-        raise NotImplementedError()
-        return factual_outcome, counterfactual_outcome
-
-
-class DeepSimpleTwinNet(BaseSimpleTwinNet):
     def __init__(
         self,
         treatment_dim: int,
         confounders_dim: int,
-        outcome_dim: int,
         outcome_noise_dim: int,
+        outcome_size: torch.Size,
     ):
         super().__init__()
+        input_dim = treatment_dim + confounders_dim + outcome_noise_dim
+        def Activation(): return nn.LeakyReLU(inplace=True)
+        """
+        # NOTE: for now using simple fully connected architecture but
+        # convolutions might end up being necessary
+        base_dim =
+        self.network = nn.Sequential(
+            nn.LazyLinear(input_dim, 256),
+            nn.LazyLinear(256, 512),
+            nn.LazyLinear(512, outcome_size.numel())
+            nn.Unflatten(outcome_size.numel(), outcome_size),
+            nn.BatchNorm2d(),
+        )
+        """
+
+        # NOTE: this architecture output need to have the same shape as the the
+        # vq-vae encoder output
+        base_dim = outcome_size[0]
+        self.network = nn.Sequential(
+            nn.LazyLinear(base_dim * 8),
+            Activation(),
+            nn.Unflatten(1, (-1, 1, 1)),
+            nn.LazyConvTranspose2d(base_dim * 4, 3, 1),
+            nn.LazyBatchNorm2d(),
+            Activation(),
+            nn.LazyConvTranspose2d(base_dim * 2, 3, 1),
+            nn.LazyBatchNorm2d(),
+            Activation(),
+            nn.LazyConvTranspose2d(base_dim, 3, 1),
+        )
+
+        # force lazy init
+        dummy_output = self.network(torch.rand(64, input_dim))
+        assert dummy_output.shape[1:] == outcome_size
 
     def forward(
         self,
@@ -43,22 +71,22 @@ class DeepSimpleTwinNet(BaseSimpleTwinNet):
         outcome_noise: Tensor
     ) -> Tuple[Tensor, Tensor]:
 
-        # TODO
-        ...
+        factual_input = torch.cat(
+            (factual_treatment, confounders, outcome_noise),
+            dim=1,
+        )
 
+        countefactual_input = torch.cat(
+            (counterfactual_treatment, confounders, outcome_noise),
+            dim=1,
+        )
 
-class CBIRDatabase:
-    def __init__(
-        self,
-        extract_feature_vector: Callable[[Tensor], Tensor],
-    ):
-        pass
+        # NOTE: for now, just have a single network i.e. assume weight sharing
+        # between the factual and counterfactual branches of the twin network
+        factual_outcome = self.network(factual_input)
+        counterfactual_outcome = self.network(countefactual_input)
 
-    def insert(image):
-        pass
-
-    def find_closest_images(img_feature_vector, top_k):
-        pass
+        return factual_outcome, counterfactual_outcome
 
 
 class PlainSwollenFracturedTwinNet(pl.LightningModule):
@@ -73,17 +101,20 @@ class PlainSwollenFracturedTwinNet(pl.LightningModule):
 
     def __init__(
         self,
-        feature_vect_dim: int,
-        outcome_noise_dim: int,
+        embedding_size: torch.Size,
+        outcome_noise_dim: int = 32,
+        lr: float = 0.001,
     ):
         super().__init__()
         self.twin_net = DeepSimpleTwinNet(
             treatment_dim=len(self.treatments),
             confounders_dim=len(self.metrics) + len(self.labels),
-            outcome_dim=feature_vect_dim,
             outcome_noise_dim=outcome_noise_dim,
+            outcome_size=embedding_size,
         )
         self.outcome_noise_dim = outcome_noise_dim
+        self.lr = lr
+        self.save_hyperparameters()
 
     def treatment_to_index(self, treatment: str) -> int:
         try:
@@ -96,7 +127,10 @@ class PlainSwollenFracturedTwinNet(pl.LightningModule):
 
     def one_hot_treatment(self, treatment: str) -> Tensor:
         return F.one_hot(
-            torch.as_tensor(self.treatement_to_index(treatment)),
+            torch.as_tensor(
+                self.treatment_to_index(treatment),
+                device=self.device,
+            ),
             num_classes=len(self.treatments),
         )
 
@@ -107,83 +141,187 @@ class PlainSwollenFracturedTwinNet(pl.LightningModule):
     ) -> Tuple[Tensor, Tensor]:
         batch_size = plain_image_label.shape[0]
 
-        # Produce one-hot encodings of binary treatement (either swell or
-        # fracture)
-        swell = self.one_hot_treatment('swell').float().repeat(batch_size)
+        # Produce one-hot encoding of binary treatement (either swell or
+        # fracture) and convert to repeated float
+        swell = \
+            self.one_hot_treatment('swell').float().expand((batch_size, -1))
         fracture = \
-            self.one_hot_treatment('fracture').float().repeat(batch_size)
+            self.one_hot_treatment('fracture').float().expand((batch_size, -1))
 
         label = F.one_hot(
-            plain_image_label,
-            num_classes=len(self.labels)
+            plain_image_label.long(),
+            num_classes=len(self.labels),
         ).float()
 
         # NOTE: for now, no metric normalisation is occurring
-        # Make a tensor merging the metrics sorted by metric name
-        # to ensure consitent order
-        metrics = torch.hstack([
-            plain_image_metrics[metric]
-            for metric in sorted(plain_image_metrics.keys())
-        ])
 
-        swollen_fv, fractured_fv = self.twin_net(
-            factual_treatment=swell,
-            counterfactual_treatment=fracture,
-            confounders=torch.hstack((label, metrics)),
-            outcome_noise=torch.randn((batch_size, self.outcome_noise_dim)),
+        # ensure consitent order of metrics and shape as column vectors
+        # for easy concatenation
+        sorted_metrics = (
+            plain_image_metrics[metric].view(-1, 1)
+            for metric in sorted(plain_image_metrics.keys())
         )
 
-        return swollen_fv, fractured_fv
+        label_and_metrics = torch.cat((label, *sorted_metrics), dim=1)
+        outcome_noise = torch.randn(
+            size=(batch_size, self.outcome_noise_dim),
+            device=self.device,
+        )
 
-    def training_step(self, batch, _batch_idx):
-        swollen_fv = batch['swollen']['feature_vector']
-        fractured_fv = batch['fractured']['feature_vector']
+        swollen_embedding, fractured_embedding = self.twin_net(
+            factual_treatment=swell,
+            counterfactual_treatment=fracture,
+            confounders=label_and_metrics,
+            outcome_noise=outcome_noise,
+        )
+
+        return swollen_embedding, fractured_embedding
+
+    def _step(self, batch):
+        swollen_z = batch['swollen']['embedding']
+        fractured_z = batch['fractured']['embedding']
         label = batch['plain']['label']
         metrics = batch['plain']['metrics']
 
-        swollen_fv_hat, fractured_fv_hat = self(label, metrics)
+        swollen_z_hat, fractured_z_hat = self(label, metrics)
 
-        swollen_fv_loss = F.mse_loss(swollen_fv_hat, swollen_fv)
-        fractured_fv_loss = F.mse_loss(fractured_fv_hat, fractured_fv)
-        loss = swollen_fv_loss + fractured_fv_loss
+        # NOTE: loss is calculated on the continous encoder outputs
+        # before vector quantization into a discrete representation
+        swollen_z_loss = F.mse_loss(swollen_z_hat, swollen_z)
+        fractured_z_loss = F.mse_loss(fractured_z_hat, fractured_z)
+        loss = swollen_z_loss + fractured_z_loss
 
-        return dict(
+        return loss, dict(
             loss=loss,
-            swollen_fv_loss=swollen_fv_loss,
-            fractured_fv_loss=fractured_fv_loss,
+            swollen_z_loss=swollen_z_loss.item(),
+            fractured_z_loss=fractured_z_loss.item(),
         )
 
+    def training_step(self, batch, _batch_idx):
+        loss, _metrics = self._step(batch)
+        return loss
 
-class PlainSwollenFracturedCCBIR:
+    def validation_step(self, batch, _batch_idx):
+        _loss, metrics = self._step(batch)
+        self.log_dict({f"val_{k}": v for k, v in metrics.items()})
+
+    def test_step(self, batch, batch_idx):
+        return self.validation_step(batch, batch_idx)
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.twin_net.parameters(), lr=self.lr)
+
+
+class PlainSwollenFracturedMorphoMNIST(CombinedDataset):
     def __init__(
         self,
-        encode: Callable[[Tensor], Tensor],
-        decode: Callable[[Tensor], Tensor],
-        database: CBIRDatabase,
-    ) -> None:
-        pass
-
-    def counterfactual_fractured_img(
-        original_img_info: dict,
-        swollen_img: Tensor,
+        *,
+        embed_image: Callable[[Tensor], Tensor],
+        train: bool,
+        transform=None,
+        plain: Optional[PlainMorphoMNIST] = None,
+        swollen: Optional[SwollenMorphoMNIST] = None,
+        fractured: Optional[FracturedMorphoMNIST] = None,
     ):
-        swollen_fv = self.encode(swollen_img)
+        self.embed_image = embed_image
 
-        pass
+        if plain is None:
+            plain = PlainMorphoMNIST(train=train, transform=transform)
+        if swollen is None:
+            swollen = SwollenMorphoMNIST(train=train, transform=transform)
+        if fractured is None:
+            fractured = FracturedMorphoMNIST(train=train, transform=transform)
 
-    def retrieve_counterfactual_fractured(
-        original_img_info,
-        swollen_img,
-    ):
-        pass
+        super().__init__(datasets={
+            "plain": plain,
+            "swollen": swollen,
+            "fractured": fractured
+        })
+
+    def __getitem__(self, index):
+        item = super().__getitem__(index)
+
+        swollen_img = item['swollen']['image']
+        fractured_img = item['fractured']['image']
+        item['swollen']['embedding'] = self.embed_image(swollen_img)
+        item['fractured']['embedding'] = self.embed_image(fractured_img)
+
+        return item
 
 
-class PlainSwellFracTwinNet(pl.LightningModule):
+class TwinNetDataModule(MorphoMNISTDataModule):
+    # TODO: better class name
     def __init__(
         self,
+        *,
+        embed_image: Callable[[Tensor], Tensor],
+        train_batch_size: int = 64,
+        test_batch_size: int = 64,
     ):
-        super().__init__()
 
+        super().__init__(
+            dataset_ctor=partial(
+                PlainSwollenFracturedMorphoMNIST,
+                embed_image=embed_image
+            ),
+            train_batch_size=train_batch_size,
+            test_batch_size=test_batch_size,
+            pin_memory=True,
+            transform=transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean=0.5, std=0.5),
+            ]),
+        )
+
+def vqvae_embed_image(vqvae: VQVAE, image: Tensor):
+    # TODO: find better place for this funcion
+    with torch.no_grad():
+        # the vqvae encoder expects a 4 dimensional tensor to support
+        # batching hence unsqueeze
+        return vqvae.encoder_net(image.unsqueeze(0)).squeeze(0)
+
+
+def main():
+    from pytorch_lightning.utilities.cli import LightningCLI
+    from pytorch_lightning.callbacks import ModelCheckpoint
+
+    vqvae = load_best_model(VQVAE)
+    embedding_size = vqvae.encoder_net(torch.rand((64, 1, 28, 28))).shape[1:]
+    print(f"{embedding_size}")
+
+    # FIXME: initialsiation, traning, saving and storing a bit hacky currently
+    # Functions signatures needed by LightningCLI so can't use functools.partial
+    def model() -> PlainSwollenFracturedTwinNet:
+        return PlainSwollenFracturedTwinNet(
+            embedding_size=embedding_size,
+        )
+
+    def datamodule() -> TwinNetDataModule:
+        return TwinNetDataModule(embed_image=partial(vqvae_embed_image, vqvae))
+
+    cli = LightningCLI(
+        model_class=model,
+        datamodule_class=datamodule,
+        save_config_overwrite=True,
+        run=False,  # deactivate automatic fitting
+        trainer_defaults=dict(
+            callbacks=[
+                ModelCheckpoint(
+                    monitor='val_loss',
+                    filename='twinnet-{epoch:03d}-{val_loss:.7f}',
+                    save_top_k=3,
+                ),
+            ],
+            max_epochs=3,
+            gpus=1,
+        ),
+    )
+    cli.trainer.fit(cli.model, datamodule=cli.datamodule)
+    cli.trainer.test(cli.model, ckpt_path="best", datamodule=cli.datamodule)
+
+
+if __name__ == "__main__":
+    main()
 
 """
 class DeepTwinNet(BaseTwinNet):

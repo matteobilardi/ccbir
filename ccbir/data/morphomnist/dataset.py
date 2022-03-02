@@ -1,4 +1,5 @@
 
+from ast import Not
 from torch import Tensor
 from ccbir.data.dataset import CombinedDataset
 from ccbir.configuration import config
@@ -16,49 +17,63 @@ import torchvision
 import tqdm
 
 
-class MorphoMNIST(MorphoMNISTLike):
+class MorphoMNIST(torchvision.datasets.VisionDataset):
+    # NOTE: for now just wrapper and adaptation of deepscm MorphoMNISTLike for
+    # consistency with torchvision and pytorch
 
     def __init__(
         self,
         data_dir: str,
-        train: bool,
         *,
-        transform: Optional[Callable[[Tensor], Tensor]] = None,
+        train: bool,
+        transform=None,
     ):
-        MorphoMNISTLike.__init__(
-            self,
+        super().__init__(root=data_dir, transform=transform)
+        self.morphomnist_like = MorphoMNISTLike(
             root_dir=data_dir,
             train=train,
             columns=None  # include all metrics available
         )
 
-        if transform is not None:
-            self.images = transform(self.images)
+        # enforce float32 metrics (instead of float64) in line with default
+        # pytorch tensors
+        self.morphomnist_like.metrics = {
+            metric: metric_values.float()
+            for metric, metric_values in self.morphomnist_like.metrics.items()
+        }
+
+    def __len__(self) -> int:
+        return len(self.morphomnist_like)
 
     def __getitem__(self, index):
-        item_old = MorphoMNISTLike.__getitem__(self, index)
-        item = dict(image=item_old['image'], label=item_old['label'])
+        item_old = self.morphomnist_like.__getitem__(index)
 
+        # enforce PIL image format consistent format with tochvision datasets
+        image_tensor = item_old['image']
+        image = PIL.Image.fromarray(image_tensor.numpy(), mode='L')
+
+        if self.transform is not None:
+            image = self.transform(image)
+
+        # place metrics under the metrics key in the dictionary
         metrics = {
             k: v for k, v in item_old.items()
             if k not in ('image', 'label')
         }
-        if len(metrics) > 0:
-            item['metrics'] = metrics
 
-        return item
+        return dict(image=image, label=item_old['label'], metrics=metrics)
 
-    @staticmethod
+    @ staticmethod
     def get_images_path(data_path: Path, train: bool):
         prefix = "train" if train else "t10k"
         return data_path / f"{prefix}-images-idx3-ubyte.gz"
 
-    @staticmethod
+    @ staticmethod
     def get_labels_path(data_path: Path, train: bool):
         prefix = "train" if train else "t10k"
         return data_path / f"{prefix}-labels-idx1-ubyte.gz"
 
-    @staticmethod
+    @ staticmethod
     def get_morpho_path(data_path: Path, train: bool):
         prefix = "train" if train else "t10k"
         return data_path / f"{prefix}-morpho.csv"
@@ -196,7 +211,7 @@ class PerturbedMorphoMNIST(MorphoMNIST):
         else:
             dataset_type = 'train' if train else 'test'
             print(
-                f"Generating {dataset_type} dataset for perturbation"
+                f"Generating {dataset_type} dataset for perturbation "
                 f"{perturbation_type}"
             )
 
@@ -207,12 +222,12 @@ class PerturbedMorphoMNIST(MorphoMNIST):
 
         super().__init__(data_dir=str(self.data_path), train=train, **kwargs)
 
-    @staticmethod
+    @ staticmethod
     def get_perturbations_args_path(data_path: Path, train: bool) -> Path:
         prefix = "train" if train else "t10k"
         return data_path / f"{prefix}-perturbations-args.csv"
 
-    @property
+    @ property
     def perturbation_name(self) -> str:
         return str(self.perturbation_type.__name__).lower()
 
@@ -234,33 +249,31 @@ class PlainMorphoMNIST(MorphoMNIST):
 
 
 class SwollenMorphoMNIST(PerturbedMorphoMNIST):
-    def __init__(self, **kwargs):
-        generator = PerturbedMorphoMNISTGenerator(Swelling, SwellingSampler())
+    def __init__(
+        self,
+        generator=PerturbedMorphoMNISTGenerator(Swelling, SwellingSampler()),
+        **kwargs,
+    ):
         super().__init__(Swelling, **kwargs, generator=generator)
 
 
 class FracturedMorphoMNIST(PerturbedMorphoMNIST):
-    def __init__(self, **kwargs):
-        generator = PerturbedMorphoMNISTGenerator(Fracture, FractureSampler())
+    def __init__(
+        self,
+        *,
+        generator=PerturbedMorphoMNISTGenerator(Fracture, FractureSampler()),
+        **kwargs
+    ):
         super().__init__(Fracture, **kwargs, generator=generator)
 
 
-class PlainSwollenFracturedMorphoMNIST(CombinedDataset):
+class LocalPerturbationsMorphoMNIST(MorphoMNIST):
+    # NOTE: for now just use the pre-built local perturbations dataset from
+    # MorphoMNIST repo i.e. randomly interleaved plain images + swelling +
+    # fractures
     def __init__(
         self,
-        plain: Optional[PlainMorphoMNIST] = None,
-        swollen: Optional[SwollenMorphoMNIST] = None,
-        fractured: Optional[SwollenMorphoMNIST] = None,
+        data_dir: str = str(config.local_morphomnist_data_path),
+        **kwargs,
     ):
-        if plain is None:
-            plain = PlainMorphoMNIST()
-        if swollen is None:
-            swollen = SwollenMorphoMNIST()
-        if fractured is None:
-            fractured = FracturedMorphoMNIST()
-
-        super().__init__(datasets={
-            "plain": plain,
-            "swollen": swollen,
-            "fractured": fractured
-        })
+        super().__init__(data_dir, **kwargs)

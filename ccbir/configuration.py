@@ -1,6 +1,7 @@
-from email.policy import strict
 from pathlib import Path
 import sys
+import pytorch_lightning as pl
+from typing import Type
 
 
 class Config:
@@ -11,6 +12,16 @@ class Config:
     @property
     def project_data_path(self) -> Path:
         return self.project_root / 'assets/data'
+
+    @property
+    def checkpoints_path(self) -> Path:
+        return self.project_root / 'assets/checkpoints'
+
+    def checkpoints_path_for_model(
+        self,
+        model_type: Type[pl.LightningModule]
+    ) -> Path:
+        return self.checkpoints_path / model_type.__name__.lower()
 
     @property
     def morphomnist_data_path(self) -> Path:
