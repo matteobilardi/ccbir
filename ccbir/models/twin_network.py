@@ -1,5 +1,3 @@
-from ccbir.configuration import config
-config.pythonpath_fix()
 from sklearn import metrics
 import torch.nn.functional as F
 import torch
@@ -14,9 +12,11 @@ from ccbir.models.model import load_best_model
 from ccbir.data.morphomnist.dataset import FracturedMorphoMNIST, PlainMorphoMNIST, SwollenMorphoMNIST
 from ccbir.data.morphomnist.datamodule import MorphoMNISTDataModule
 from ccbir.data.dataset import CombinedDataset
+from ccbir.configuration import config
+config.pythonpath_fix()
 
 
-class DeepSimpleTwinNet(nn.Module):
+class SimpleDeepTwinNetComponent(nn.Module):
     """Twin network for DAG: X -> Y <- Z that allows sampling from
     P(Y, Y* | X, X*, Z)"""
 
@@ -89,112 +89,51 @@ class DeepSimpleTwinNet(nn.Module):
         return factual_outcome, counterfactual_outcome
 
 
-class PlainSwollenFracturedTwinNet(pl.LightningModule):
-    # NOTE: For now relying on binary treatments: either swelling or
-    # fracture
-    treatments = ["swell", "fracture"]
-    _treatement_to_index = {t: idx for idx, t in enumerate(treatments)}
-
-    # TODO: probaby better move metrics and labels somewhere more appropriate
-    metrics = ['area', 'length', 'thickness', 'slant', 'width', 'height']
-    labels = list(range(10))
-
+class SimpleDeepTwinNet(pl.LightningModule):
     def __init__(
         self,
-        embedding_size: torch.Size,
-        outcome_noise_dim: int = 32,
-        lr: float = 0.001,
+        treatment_dim: int,
+        confounders_dim: int,
+        outcome_noise_dim: int,
+        outcome_size: torch.Size,
+        lr: float,
     ):
         super().__init__()
-        self.twin_net = DeepSimpleTwinNet(
-            treatment_dim=len(self.treatments),
-            confounders_dim=len(self.metrics) + len(self.labels),
+        self.twin_net = SimpleDeepTwinNetComponent(
+            treatment_dim=treatment_dim,
+            confounders_dim=confounders_dim,
             outcome_noise_dim=outcome_noise_dim,
-            outcome_size=embedding_size,
+            outcome_size=outcome_size,
         )
         self.outcome_noise_dim = outcome_noise_dim
         self.lr = lr
         self.save_hyperparameters()
 
-    def treatment_to_index(self, treatment: str) -> int:
-        try:
-            return self._treatement_to_index[treatment]
-        except KeyError:
-            raise ValueError(
-                f"{treatment=} is not a valid treatment: must be one of "
-                f"{', '.join(self.treatments)}"
-            )
-
-    def one_hot_treatment(self, treatment: str) -> Tensor:
-        return F.one_hot(
-            torch.as_tensor(
-                self.treatment_to_index(treatment),
-                device=self.device,
-            ),
-            num_classes=len(self.treatments),
-        )
-
-    def forward(
-        self,
-        plain_image_label: Tensor,
-        plain_image_metrics: Dict[str, Tensor],
-    ) -> Tuple[Tensor, Tensor]:
-        batch_size = plain_image_label.shape[0]
-
-        # Produce one-hot encoding of binary treatement (either swell or
-        # fracture) and convert to repeated float
-        swell = \
-            self.one_hot_treatment('swell').float().expand((batch_size, -1))
-        fracture = \
-            self.one_hot_treatment('fracture').float().expand((batch_size, -1))
-
-        label = F.one_hot(
-            plain_image_label.long(),
-            num_classes=len(self.labels),
-        ).float()
-
-        # NOTE: for now, no metric normalisation is occurring
-
-        # ensure consitent order of metrics and shape as column vectors
-        # for easy concatenation
-        sorted_metrics = (
-            plain_image_metrics[metric].view(-1, 1)
-            for metric in sorted(plain_image_metrics.keys())
-        )
-
-        label_and_metrics = torch.cat((label, *sorted_metrics), dim=1)
-        outcome_noise = torch.randn(
-            size=(batch_size, self.outcome_noise_dim),
-            device=self.device,
-        )
-
-        swollen_embedding, fractured_embedding = self.twin_net(
-            factual_treatment=swell,
-            counterfactual_treatment=fracture,
-            confounders=label_and_metrics,
-            outcome_noise=outcome_noise,
-        )
-
-        return swollen_embedding, fractured_embedding
+    def forward(self, x) -> Tuple[Tensor, Tensor]:
+        return self.twin_net(**x)
 
     def _step(self, batch):
-        swollen_z = batch['swollen']['embedding']
-        fractured_z = batch['fractured']['embedding']
-        label = batch['plain']['label']
-        metrics = batch['plain']['metrics']
+        X, y = batch
 
-        swollen_z_hat, fractured_z_hat = self(label, metrics)
+        factual_outcome_hat, counterfactual_outcome_hat = self(X)
+
+        factual_outcome = y['factual_outcome']
+        counterfactual_outcome = y['counterfactual_outcome']
 
         # NOTE: loss is calculated on the continous encoder outputs
         # before vector quantization into a discrete representation
-        swollen_z_loss = F.mse_loss(swollen_z_hat, swollen_z)
-        fractured_z_loss = F.mse_loss(fractured_z_hat, fractured_z)
-        loss = swollen_z_loss + fractured_z_loss
+        factual_loss = F.mse_loss(factual_outcome_hat, factual_outcome)
+        counterfactual_loss = F.mse_loss(
+            counterfactual_outcome_hat,
+            counterfactual_outcome,
+        )
+
+        loss = factual_loss + counterfactual_loss
 
         return loss, dict(
             loss=loss,
-            swollen_z_loss=swollen_z_loss.item(),
-            fractured_z_loss=fractured_z_loss.item(),
+            factual_loss=factual_loss.item(),
+            counterfactual_loss=counterfactual_loss.item(),
         )
 
     def training_step(self, batch, _batch_idx):
@@ -212,44 +151,113 @@ class PlainSwollenFracturedTwinNet(pl.LightningModule):
         return torch.optim.Adam(self.twin_net.parameters(), lr=self.lr)
 
 
-class PlainSwollenFracturedMorphoMNIST(CombinedDataset):
+class PSFTwinNetDataset:
+    # NOTE: For now relying on binary treatments: either swelling or
+    # fracture
+    treatments = ["swell", "fracture"]
+    _treatement_to_index = {t: idx for idx, t in enumerate(treatments)}
+
+    # TODO: probaby better move metrics and labels somewhere more appropriate
+    metrics = ['area', 'length', 'thickness', 'slant', 'width', 'height']
+    labels = list(range(10))
+    outcome_noise_dim: int = 32
+
     def __init__(
         self,
         *,
         embed_image: Callable[[Tensor], Tensor],
         train: bool,
         transform=None,
-        plain: Optional[PlainMorphoMNIST] = None,
-        swollen: Optional[SwollenMorphoMNIST] = None,
-        fractured: Optional[FracturedMorphoMNIST] = None,
     ):
         self.embed_image = embed_image
+        self.psf_dataset = CombinedDataset(dict(
+            plain=PlainMorphoMNIST(train=train, transform=transform),
+            swollen=SwollenMorphoMNIST(train=train, transform=transform),
+            fractured=FracturedMorphoMNIST(train=train, transform=transform),
+        ))
+        self.outcome_noise = torch.randn(
+            (len(self.psf_dataset), self.outcome_noise_dim),
+        )
 
-        if plain is None:
-            plain = PlainMorphoMNIST(train=train, transform=transform)
-        if swollen is None:
-            swollen = SwollenMorphoMNIST(train=train, transform=transform)
-        if fractured is None:
-            fractured = FracturedMorphoMNIST(train=train, transform=transform)
+    def treatment_to_index(self, treatment: str) -> int:
+        try:
+            return self._treatement_to_index[treatment]
+        except KeyError:
+            raise ValueError(
+                f"{treatment=} is not a valid treatment: must be one of "
+                f"{', '.join(self.treatments)}"
+            )
 
-        super().__init__(datasets={
-            "plain": plain,
-            "swollen": swollen,
-            "fractured": fractured
-        })
+    def one_hot_treatment(self, treatment: str) -> Tensor:
+        return F.one_hot(
+            torch.as_tensor(self.treatment_to_index(treatment)),
+            num_classes=len(self.treatments),
+        )
+
+    def __len__(self):
+        return len(self.psf_dataset)
 
     def __getitem__(self, index):
-        item = super().__getitem__(index)
+        psf_item = self.psf_dataset[index]
+        outcome_noise = self.outcome_noise[index]
 
-        swollen_img = item['swollen']['image']
-        fractured_img = item['fractured']['image']
-        item['swollen']['embedding'] = self.embed_image(swollen_img)
-        item['fractured']['embedding'] = self.embed_image(fractured_img)
+        # Produce one-hot encoding of binary treatement (either swell or
+        # fracture) and convert to repeated float
+        swell = self.one_hot_treatment('swell').float()
+        fracture = self.one_hot_treatment('fracture').float()
 
-        return item
+        label = F.one_hot(
+            psf_item['plain']['label'].long(),
+            num_classes=len(self.labels),
+        ).float()
+
+        # NOTE: for now, no metric normalisation is occurring
+
+        # ensure consitent order of metrics
+        metrics = psf_item['plain']['metrics']
+        sorted_metrics = torch.tensor([
+            metrics[metric] for metric in sorted(metrics.keys())
+        ])
+
+        label_and_metrics = torch.cat((label, sorted_metrics))
+
+        x = dict(
+            factual_treatment=swell,
+            counterfactual_treatment=fracture,
+            confounders=label_and_metrics,
+            outcome_noise=outcome_noise,
+        )
+
+        swollen_z = self.embed_image(psf_item['swollen']['image'])
+        fractured_z = self.embed_image(psf_item['fractured']['image'])
+
+        y = dict(
+            factual_outcome=swollen_z,
+            counterfactual_outcome=fractured_z,
+        )
+
+        return x, y
 
 
-class TwinNetDataModule(MorphoMNISTDataModule):
+class PSFTwinNet(SimpleDeepTwinNet):
+    def __init__(
+        self,
+        outcome_size: torch.Size,
+        lr: float = 0.001,
+    ):
+        super().__init__(
+            outcome_size=outcome_size,
+            treatment_dim=len(PSFTwinNetDataset.treatments),
+            confounders_dim=(
+                len(PSFTwinNetDataset.labels) + len(PSFTwinNetDataset.metrics)
+            ),
+            outcome_noise_dim=PSFTwinNetDataset.outcome_noise_dim,
+            lr=lr,
+        )
+        self.save_hyperparameters()
+
+
+class PSFTwinNetDataModule(MorphoMNISTDataModule):
     # TODO: better class name
     def __init__(
         self,
@@ -261,7 +269,7 @@ class TwinNetDataModule(MorphoMNISTDataModule):
 
         super().__init__(
             dataset_ctor=partial(
-                PlainSwollenFracturedMorphoMNIST,
+                PSFTwinNetDataset,
                 embed_image=embed_image
             ),
             train_batch_size=train_batch_size,
@@ -272,6 +280,7 @@ class TwinNetDataModule(MorphoMNISTDataModule):
                 transforms.Normalize(mean=0.5, std=0.5),
             ]),
         )
+
 
 def vqvae_embed_image(vqvae: VQVAE, image: Tensor):
     # TODO: find better place for this funcion
@@ -291,13 +300,13 @@ def main():
 
     # FIXME: initialsiation, traning, saving and storing a bit hacky currently
     # Functions signatures needed by LightningCLI so can't use functools.partial
-    def model() -> PlainSwollenFracturedTwinNet:
-        return PlainSwollenFracturedTwinNet(
-            embedding_size=embedding_size,
-        )
+    def model() -> PSFTwinNet:
+        return PSFTwinNet(outcome_size=embedding_size)
 
-    def datamodule() -> TwinNetDataModule:
-        return TwinNetDataModule(embed_image=partial(vqvae_embed_image, vqvae))
+    def datamodule() -> PSFTwinNetDataModule:
+        return PSFTwinNetDataModule(
+            embed_image=partial(vqvae_embed_image, vqvae)
+        )
 
     cli = LightningCLI(
         model_class=model,
@@ -312,7 +321,7 @@ def main():
                     save_top_k=3,
                 ),
             ],
-            max_epochs=3,
+            max_epochs=2,
             gpus=1,
         ),
     )

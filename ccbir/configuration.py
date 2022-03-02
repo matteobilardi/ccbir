@@ -31,8 +31,6 @@ class Config:
 
     @property
     def original_mnist_data_path(self) -> Path:
-        # TODO: find a better, sensible way to keep track of all of the data and
-        # project directories, e.g. read object starting from yaml config
         return self.morphomnist_data_path / 'original'
 
     @property
