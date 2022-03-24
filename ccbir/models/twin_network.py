@@ -1,5 +1,4 @@
-from ccbir.configuration import config
-config.pythonpath_fix()
+from torch.utils.data import Dataset
 import torch.nn.functional as F
 import torch
 import pytorch_lightning as pl
@@ -16,6 +15,8 @@ from ccbir.data.morphomnist.dataset import (
 )
 from ccbir.data.morphomnist.datamodule import MorphoMNISTDataModule
 from ccbir.data.dataset import CombinedDataset
+from ccbir.configuration import config
+config.pythonpath_fix()
 
 
 class SimpleDeepTwinNetComponent(nn.Module):
@@ -27,66 +28,95 @@ class SimpleDeepTwinNetComponent(nn.Module):
         treatment_dim: int,
         confounders_dim: int,
         outcome_noise_dim: int,
-        outcome_size: torch.Size,
+        outcome_shape: torch.Size,
+        noise_inject_mode: Literal['concat', 'add', 'multiply'] = 'concat',
     ):
         super().__init__()
-        input_dim = treatment_dim + confounders_dim + outcome_noise_dim
-        def Activation(): return nn.LeakyReLU(inplace=True)
-        """
-        # NOTE: for now using simple fully connected architecture but
-        # convolutions might end up being necessary
-        base_dim =
-        self.network = nn.Sequential(
-            nn.LazyLinear(input_dim, 256),
-            nn.LazyLinear(256, 512),
-            nn.LazyLinear(512, outcome_size.numel())
-            nn.Unflatten(outcome_size.numel(), outcome_size),
-            nn.BatchNorm2d(),
-        )
-        """
 
-        # NOTE: this architecture output need to have the same shape as the the
+        # TODO: For clarity consider not using lazy layers once the architecture
+        # is stabilised
+
+        def Activation(): return nn.LeakyReLU(inplace=True)
+
+        # NOTE: this architecture output needs to have the same shape as the
         # vq-vae encoder output
-        base_dim = outcome_size[0]
-        self.network = nn.Sequential(
+        base_dim = outcome_shape[0]
+        self.net = nn.Sequential(
             nn.LazyLinear(base_dim * 8),
             Activation(),
             nn.Unflatten(1, (-1, 1, 1)),
             nn.LazyConvTranspose2d(base_dim * 4, 3, 1),
-            nn.LazyBatchNorm2d(),
+            # nn.LazyBatchNorm2d(),
             Activation(),
             nn.LazyConvTranspose2d(base_dim * 2, 3, 1),
-            nn.LazyBatchNorm2d(),
+            # nn.LazyBatchNorm2d(),
             Activation(),
             nn.LazyConvTranspose2d(base_dim, 3, 1),
         )
 
+        self.data_dim = treatment_dim + confounders_dim
+
+        if noise_inject_mode == 'concat':
+            self.input_dim = self.data_dim * 2
+            self.inject_noise = (
+                lambda data, noise: torch.concat((data, noise), dim=1)
+            )
+        elif noise_inject_mode == 'add':
+            self.input_dim = self.data_dim
+            self.inject_noise = torch.add
+        elif noise_inject_mode == 'multiply':
+            self.input_dim = self.data_dim
+            self.inject_noise = torch.mul
+        else:
+            raise TypeError(f"Invalid {noise_inject_mode=}")
+
+        # NOTE: to inject noise via multiplication/addition, we currently force
+        # the reparametrised noise to have the same number of dimensions as the
+        # data (i.e. [treatement, confounders]) regardless of the value of
+        # outcome_noise_dim, which is just the size of the input to the
+        # reparametrize_noise_net. For pure convenience, currentll this is the
+        # case even when we inject noise by concatenation
+        self.reparametrize_noise_net = nn.Sequential(
+            # For now just a linear layer, but might need something with more
+            # representation power
+            nn.LazyLinear(self.data_dim),
+        )
+
         # force lazy init
-        dummy_output = self.network(torch.rand(64, input_dim))
-        assert dummy_output.shape[1:] == outcome_size
+        dummy_noise_output = self.reparametrize_noise_net(
+            torch.rand(64, outcome_noise_dim)
+        )
+        dummy_output = self.net(torch.rand(64, self.input_dim))
+
+        assert dummy_noise_output.shape[1] == self.data_dim
+        assert dummy_output.shape[1:] == outcome_shape
 
     def forward(
         self,
         factual_treatment: Tensor,
         counterfactual_treatment: Tensor,
         confounders: Tensor,
-        outcome_noise: Tensor
+        outcome_noise: Tensor,
     ) -> Tuple[Tensor, Tensor]:
 
-        factual_input = torch.cat(
-            (factual_treatment, confounders, outcome_noise),
+        factual_data = torch.cat(
+            (factual_treatment, confounders),
+            dim=1
+        )
+        counterfactual_data = torch.cat(
+            (counterfactual_treatment, confounders),
             dim=1,
         )
 
-        counterfactual_input = torch.cat(
-            (counterfactual_treatment, confounders, outcome_noise),
-            dim=1,
-        )
+        noise = self.reparametrize_noise_net(outcome_noise)
+        factual_input = self.inject_noise(factual_data, noise)
+        counterfactual_input = self.inject_noise(counterfactual_data, noise)
 
-        # NOTE: for now, just have a single network i.e. assume weight sharing
-        # between the factual and counterfactual branches of the twin network
-        factual_outcome = self.network(factual_input)
-        counterfactual_outcome = self.network(counterfactual_input)
+        # for now, just have a single network so as to implicitly enforce
+        # weight sharing between the factual and counterfactual branches of the
+        # twin network
+        factual_outcome = self.net(factual_input)
+        counterfactual_outcome = self.net(counterfactual_input)
 
         return factual_outcome, counterfactual_outcome
 
@@ -105,7 +135,7 @@ class SimpleDeepTwinNet(pl.LightningModule):
             treatment_dim=treatment_dim,
             confounders_dim=confounders_dim,
             outcome_noise_dim=outcome_noise_dim,
-            outcome_size=outcome_size,
+            outcome_shape=outcome_size,
         )
         self.outcome_noise_dim = outcome_noise_dim
         self.lr = lr
@@ -153,9 +183,9 @@ class SimpleDeepTwinNet(pl.LightningModule):
         return torch.optim.Adam(self.twin_net.parameters(), lr=self.lr)
 
 
-class PSFTwinNetDataset:
-    # NOTE: For now relying on binary treatments: either swelling or
-    # fracture
+class PSFTwinNetDataset(Dataset):
+    # NOTE: For now relying only binary treatments: either swelling or
+    # fracture but might want to expand in the future
     treatments = ["swell", "fracture"]
     _treatement_to_index = {t: idx for idx, t in enumerate(treatments)}
 
@@ -203,8 +233,9 @@ class PSFTwinNetDataset:
         ).float()
 
     def metrics_vector(self, metrics: Dict[str, Tensor]) -> Tensor:
-        # ensure consitent order of metrics
         # NOTE: for now, no metric normalisation is occurring
+
+        # ensure consitent order of metrics
         sorted_metrics = torch.tensor([
             metrics[metric] for metric in sorted(metrics.keys())
         ])

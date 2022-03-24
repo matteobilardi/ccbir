@@ -13,7 +13,10 @@ class MorphoMNISTDataModule(pl.LightningDataModule):
     def __init__(
         self,
         *,
-        dataset_ctor: Optional[Union[Type[MorphoMNIST], Callable[..., MorphoMNIST]]],
+        dataset_ctor: Optional[Union[
+            Type[MorphoMNIST],
+            Callable[..., MorphoMNIST]
+        ]],
         num_workers: int = multiprocessing.cpu_count(),
         train_batch_size: int,
         test_batch_size: int,

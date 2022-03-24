@@ -18,14 +18,16 @@ class VQVAE(pl.LightningModule):
     def __init__(
         self,
         in_channels: int = 1,
-        codebook_size: int = 512,          # K
+        codebook_size: int = 512,         # K
         latent_dim: int = 16,             # dimension of z
         commit_loss_weight: float = 1.0,  # beta
         lr: float = 2e-4,
     ):
         super().__init__()
         self.model = VectorQuantizedVAE(
-            in_channels, latent_dim, K=codebook_size
+            input_dim=in_channels,
+            dim=latent_dim,
+            K=codebook_size,
         )
         self.commit_loss_weight = commit_loss_weight
         self.lr = lr
