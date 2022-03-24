@@ -1,6 +1,7 @@
 
 from ast import Not
 from torch import Tensor
+import torch
 from ccbir.data.dataset import CombinedDataset
 from ccbir.configuration import config
 from ccbir.data.morphomnist.perturbsampler import FractureSampler, PerturbationSampler, SwellingSampler
@@ -32,13 +33,13 @@ class MorphoMNIST(torchvision.datasets.VisionDataset):
         self.morphomnist_like = MorphoMNISTLike(
             root_dir=data_dir,
             train=train,
-            columns=None  # include all metrics available
+            columns=None,  # include all metrics available
         )
 
         # enforce float32 metrics (instead of float64) in line with default
         # pytorch tensors
         self.morphomnist_like.metrics = {
-            metric: metric_values.float()
+            metric: metric_values.to(torch.float32)
             for metric, metric_values in self.morphomnist_like.metrics.items()
         }
 
@@ -55,7 +56,7 @@ class MorphoMNIST(torchvision.datasets.VisionDataset):
         if self.transform is not None:
             image = self.transform(image)
 
-        # place metrics under the metrics key in the dictionary
+        # nest metrics under the metrics key in the final item
         metrics = {
             k: v for k, v in item_old.items()
             if k not in ('image', 'label')

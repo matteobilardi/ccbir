@@ -1,19 +1,21 @@
-from sklearn import metrics
+from ccbir.configuration import config
+config.pythonpath_fix()
 import torch.nn.functional as F
 import torch
 import pytorch_lightning as pl
-from typing import Callable, Dict, Mapping, Optional, Tuple
+from typing import Callable, Dict, Literal, Mapping, Optional, Tuple
 from torchvision import transforms
-from torch.distributions import Distribution
 from torch import Tensor, embedding, nn
 from functools import partial
 from ccbir.models.vqvae import VQVAE
 from ccbir.models.model import load_best_model
-from ccbir.data.morphomnist.dataset import FracturedMorphoMNIST, PlainMorphoMNIST, SwollenMorphoMNIST
+from ccbir.data.morphomnist.dataset import (
+    FracturedMorphoMNIST,
+    PlainMorphoMNIST,
+    SwollenMorphoMNIST
+)
 from ccbir.data.morphomnist.datamodule import MorphoMNISTDataModule
 from ccbir.data.dataset import CombinedDataset
-from ccbir.configuration import config
-config.pythonpath_fix()
 
 
 class SimpleDeepTwinNetComponent(nn.Module):
@@ -76,7 +78,7 @@ class SimpleDeepTwinNetComponent(nn.Module):
             dim=1,
         )
 
-        countefactual_input = torch.cat(
+        counterfactual_input = torch.cat(
             (counterfactual_treatment, confounders, outcome_noise),
             dim=1,
         )
@@ -84,7 +86,7 @@ class SimpleDeepTwinNetComponent(nn.Module):
         # NOTE: for now, just have a single network i.e. assume weight sharing
         # between the factual and counterfactual branches of the twin network
         factual_outcome = self.network(factual_input)
-        counterfactual_outcome = self.network(countefactual_input)
+        counterfactual_outcome = self.network(counterfactual_input)
 
         return factual_outcome, counterfactual_outcome
 
@@ -157,7 +159,7 @@ class PSFTwinNetDataset:
     treatments = ["swell", "fracture"]
     _treatement_to_index = {t: idx for idx, t in enumerate(treatments)}
 
-    # TODO: probaby better move metrics and labels somewhere more appropriate
+    # TODO: probably better move metrics and labels somewhere more appropriate
     metrics = ['area', 'length', 'thickness', 'slant', 'width', 'height']
     labels = list(range(10))
     outcome_noise_dim: int = 32
@@ -192,7 +194,22 @@ class PSFTwinNetDataset:
         return F.one_hot(
             torch.as_tensor(self.treatment_to_index(treatment)),
             num_classes=len(self.treatments),
-        )
+        ).float()
+
+    def one_hot_label(self, label: Tensor) -> Tensor:
+        return F.one_hot(
+            label.long(),
+            num_classes=len(self.labels)
+        ).float()
+
+    def metrics_vector(self, metrics: Dict[str, Tensor]) -> Tensor:
+        # ensure consitent order of metrics
+        # NOTE: for now, no metric normalisation is occurring
+        sorted_metrics = torch.tensor([
+            metrics[metric] for metric in sorted(metrics.keys())
+        ])
+
+        return sorted_metrics
 
     def __len__(self):
         return len(self.psf_dataset)
@@ -201,25 +218,11 @@ class PSFTwinNetDataset:
         psf_item = self.psf_dataset[index]
         outcome_noise = self.outcome_noise[index]
 
-        # Produce one-hot encoding of binary treatement (either swell or
-        # fracture) and convert to repeated float
-        swell = self.one_hot_treatment('swell').float()
-        fracture = self.one_hot_treatment('fracture').float()
-
-        label = F.one_hot(
-            psf_item['plain']['label'].long(),
-            num_classes=len(self.labels),
-        ).float()
-
-        # NOTE: for now, no metric normalisation is occurring
-
-        # ensure consitent order of metrics
-        metrics = psf_item['plain']['metrics']
-        sorted_metrics = torch.tensor([
-            metrics[metric] for metric in sorted(metrics.keys())
-        ])
-
-        label_and_metrics = torch.cat((label, sorted_metrics))
+        swell = self.one_hot_treatment('swell')
+        fracture = self.one_hot_treatment('fracture')
+        label = self.one_hot_label(psf_item['plain']['label'])
+        metrics = self.metrics_vector(psf_item['plain']['metrics'])
+        label_and_metrics = torch.cat((label, metrics))
 
         x = dict(
             factual_treatment=swell,
