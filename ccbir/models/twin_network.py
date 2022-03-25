@@ -36,11 +36,14 @@ class SimpleDeepTwinNetComponent(nn.Module):
         # TODO: For clarity consider not using lazy layers once the architecture
         # is stabilised
 
-        def Activation(): return nn.LeakyReLU(inplace=True)
+        def Activation():
+            return nn.LeakyReLU(inplace=True)
 
         # NOTE: this architecture output needs to have the same shape as the
         # vq-vae encoder output
         base_dim = outcome_shape[0]
+
+        """
         self.net = nn.Sequential(
             nn.LazyLinear(base_dim * 8),
             Activation(),
@@ -52,6 +55,21 @@ class SimpleDeepTwinNetComponent(nn.Module):
             # nn.LazyBatchNorm2d(),
             Activation(),
             nn.LazyConvTranspose2d(base_dim, 3, 1),
+        )
+        """
+        self.net = nn.Sequential(
+            nn.Unflatten(1, (-1, 1, 1)),
+            nn.LazyConvTranspose2d(128, 2),
+            Activation(),
+            nn.LazyConvTranspose2d(128, 2),
+            Activation(),
+            nn.LazyConvTranspose2d(64, 2),
+            Activation(),
+            nn.LazyConvTranspose2d(64, 2),
+            Activation(),
+            nn.LazyConvTranspose2d(32, 2),
+            Activation(),
+            nn.LazyConvTranspose2d(16, 2),
         )
 
         self.data_dim = treatment_dim + confounders_dim
@@ -84,9 +102,9 @@ class SimpleDeepTwinNetComponent(nn.Module):
 
         # force lazy init
         dummy_noise_output = self.reparametrize_noise_net(
-            torch.rand(64, outcome_noise_dim)
+            torch.rand(1, outcome_noise_dim)
         )
-        dummy_output = self.net(torch.rand(64, self.input_dim))
+        dummy_output = self.net(torch.rand(1, self.input_dim))
 
         assert dummy_noise_output.shape[1] == self.data_dim
         assert dummy_output.shape[1:] == outcome_shape
@@ -200,13 +218,22 @@ class PSFTwinNetDataset(Dataset):
         embed_image: Callable[[Tensor], Tensor],
         train: bool,
         transform=None,
+        normalize_metrics: bool = True,
     ):
+        super().__init__()
         self.embed_image = embed_image
+
+        kwargs = dict(
+            train=train,
+            transform=transform,
+            normalize_metrics=normalize_metrics
+        )
         self.psf_dataset = CombinedDataset(dict(
-            plain=PlainMorphoMNIST(train=train, transform=transform),
-            swollen=SwollenMorphoMNIST(train=train, transform=transform),
-            fractured=FracturedMorphoMNIST(train=train, transform=transform),
+            plain=PlainMorphoMNIST(**kwargs),
+            swollen=SwollenMorphoMNIST(**kwargs),
+            fractured=FracturedMorphoMNIST(**kwargs),
         ))
+
         self.outcome_noise = torch.randn(
             (len(self.psf_dataset), self.outcome_noise_dim),
         )
@@ -277,7 +304,7 @@ class PSFTwinNet(SimpleDeepTwinNet):
     def __init__(
         self,
         outcome_size: torch.Size,
-        lr: float = 0.001,
+        lr: float = 0.0005,
     ):
         super().__init__(
             outcome_size=outcome_size,
@@ -355,7 +382,7 @@ def main():
                     save_top_k=3,
                 ),
             ],
-            max_epochs=2,
+            max_epochs=2000,
             gpus=1,
         ),
     )
@@ -365,38 +392,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-"""
-class DeepTwinNet(BaseTwinNet):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, observed_factual_intensity, intervention_counterfactual_intensity):
-        noise_thickness = sample_gaussian()
-        sampled_factual_thickness = f_thickness(
-            observed_factual_intensity, noise_thickness)
-        sampled_counterfactual_thickness = f_thickness(
-            do_counterfactual_intensity, noise_thickness)
-
-        noise_image = sample_gaussian())
-        sampled_factual_image = f_image(
-            observed_factual_intensity, sampled_factual_thickness, noise_image)
-        sampled_counterfactual_image = f_image(
-            intervention_counterfactual_intensity, sampled_counterfactual_thickness, noise_image)
-
-
-        output = {
-            'factual': [observed_factual_intensity, sampled_factual_thickness, sampled_factual_image]
-            'counterfactual': [intervention_counterfactual_intensity, sampled_counterfactual_thickness, sampled_counterfactual_image]
-        }
-
-        return output
-
-    def sample(self, observed_intensity, observed_thickness, observed_image, intervention_intensity):
-        while True:
-            output = self.forward(observed_intensity, intervention_intensity)
-            _, sampled_thickness, sampled_image =  output['factual']
-            if sampled_thickness.isclose(observed_thickness) and sampled_image.isclose(observed_image):
-                _, _, counterfactual_image = output['counterfactual']
-                return counterfactual_image"
-"""

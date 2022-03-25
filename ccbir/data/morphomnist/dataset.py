@@ -1,21 +1,22 @@
 
-from ast import Not
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils.validation import check_is_fitted
 from torch import Tensor
 import torch
-from ccbir.data.dataset import CombinedDataset
 from ccbir.configuration import config
 from ccbir.data.morphomnist.perturbsampler import FractureSampler, PerturbationSampler, SwellingSampler
-from deepscm.datasets.morphomnist import MorphoMNISTLike, save_morphomnist_like
+from deepscm.datasets.morphomnist import MorphoMNISTLike, load_morphomnist_like, save_morphomnist_like
 from deepscm.morphomnist.morpho import ImageMorphology
 from deepscm.morphomnist.perturb import Fracture, Perturbation, Swelling
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple, Type, Union
+from typing import Callable, Dict, List, Optional, Tuple, Type, Union
 import PIL
 import multiprocessing
 import numpy as np
 import pandas as pd
 import torchvision
 import tqdm
+import pickle
 
 
 class MorphoMNIST(torchvision.datasets.VisionDataset):
@@ -28,53 +29,112 @@ class MorphoMNIST(torchvision.datasets.VisionDataset):
         *,
         train: bool,
         transform=None,
+        normalize_metrics: bool = False,
     ):
         super().__init__(root=data_dir, transform=transform)
-        self.morphomnist_like = MorphoMNISTLike(
+
+        self.data_dir = data_dir
+        self.train = train
+        
+        images, labels, metrics_df = load_morphomnist_like(
             root_dir=data_dir,
             train=train,
-            columns=None,  # include all metrics available
+            columns=None  # include all metrics available
         )
+        assert len(images) == len(labels) and len(images) == len(metrics_df)
+        self.images = images
+        self.labels: Tensor = torch.as_tensor(labels)
 
-        # enforce float32 metrics (instead of float64) in line with default
-        # pytorch tensors
-        self.morphomnist_like.metrics = {
-            metric: metric_values.to(torch.float32)
-            for metric, metric_values in self.morphomnist_like.metrics.items()
+        # enforce float32 metrics (instead of float64 of loaded numpy array) in
+        # line with default pytorch tensors
+        self.metrics = {
+            metric_name: torch.tensor(
+                metric_values.values,
+                dtype=torch.float32
+            )
+            for metric_name, metric_values in metrics_df.items()
         }
 
+        if normalize_metrics:
+            self.metrics = self._normalize_metrics(self.metrics)
+
+    def _raw_training_metrics(self):
+        """Metrics from the training dataset without any normalisation"""
+
+        if self.train:
+            return self.metrics
+        else:
+            return self.__class__(self.data_dir, train=True).metrics
+
+    def _load_scalers(self) -> Dict[str, StandardScaler]:
+        scalers_file = Path(self.root) / 'metrics_scalers.pkl'
+
+        # load from disk scalers for each metric if they exits, otherwise fit
+        # new scalers and save them to disk for future use
+        if scalers_file.exists():
+            with open(scalers_file, 'rb') as f:
+                scaler_for_metric = pickle.load(f)
+            
+            for scaler in scaler_for_metric.values():
+                check_is_fitted(scaler)
+        else:
+
+            # never fit a scaler on the test data!
+            fittable_metrics = self._raw_training_metrics()
+
+            scaler_for_metric = {}
+            for metric, metric_values in fittable_metrics.items():
+                scaler = StandardScaler()
+                # standard scaler requires 2d array hence view
+                scaler.fit(metric_values.view(-1, 1).numpy())
+                scaler_for_metric[metric] = scaler
+
+            # scalers_file.touch()
+            scalers_file.write_bytes(pickle.dumps(scaler_for_metric))
+
+        return scaler_for_metric
+
+    def _normalize_metrics(
+        self,
+        metrics: Dict[str, Tensor]
+    ) -> Dict[str, Tensor]:
+        scaler_for_metric = self._load_scalers()
+        normalized_metrics = {
+            metric: torch.from_numpy(
+                scaler_for_metric[metric].transform(
+                    metric_values.view(-1, 1).numpy()
+                ).flatten()
+            )
+            for metric, metric_values in metrics.items()
+        }
+
+        return normalized_metrics
+
     def __len__(self) -> int:
-        return len(self.morphomnist_like)
+        return len(self.images)
 
     def __getitem__(self, index):
-        item_old = self.morphomnist_like.__getitem__(index)
-
         # enforce PIL image format consistent format with tochvision datasets
-        image_tensor = item_old['image']
-        image = PIL.Image.fromarray(image_tensor.numpy(), mode='L')
+        image = PIL.Image.fromarray(self.images[index], mode='L')
 
         if self.transform is not None:
             image = self.transform(image)
 
-        # nest metrics under the metrics key in the final item
-        metrics = {
-            k: v for k, v in item_old.items()
-            if k not in ('image', 'label')
-        }
+        metrics = {k: v[index] for k, v in self.metrics.items()}
 
-        return dict(image=image, label=item_old['label'], metrics=metrics)
+        return dict(image=image, label=self.labels[index], metrics=metrics)
 
-    @ staticmethod
+    @staticmethod
     def get_images_path(data_path: Path, train: bool):
         prefix = "train" if train else "t10k"
         return data_path / f"{prefix}-images-idx3-ubyte.gz"
 
-    @ staticmethod
+    @staticmethod
     def get_labels_path(data_path: Path, train: bool):
         prefix = "train" if train else "t10k"
         return data_path / f"{prefix}-labels-idx1-ubyte.gz"
 
-    @ staticmethod
+    @staticmethod
     def get_morpho_path(data_path: Path, train: bool):
         prefix = "train" if train else "t10k"
         return data_path / f"{prefix}-morpho.csv"
@@ -126,8 +186,9 @@ class PerturbedMorphoMNISTGenerator:
     ):
         original_dataset = MorphoMNISTLike(self.original_data_dir, train=train)
         original_images = original_dataset.images
-        perturbations, perturbations_args =  \
+        perturbations, perturbations_args = (
             self.perturbation_sampler.sample(len(original_images))
+        )
 
         with multiprocessing.Pool() as pool:
             perturbed_images_gen = pool.imap(
@@ -150,8 +211,9 @@ class PerturbedMorphoMNISTGenerator:
         out_path = Path(out_dir)
         out_path.mkdir(parents=True, exist_ok=True)
 
-        perturbations_args_path = \
+        perturbations_args_path = (
             PerturbedMorphoMNIST.get_perturbations_args_path(out_path, train)
+        )
 
         # TODO? For now no need to compute metrics for perturbed images
         # but might become necessary in the future
@@ -195,15 +257,17 @@ class PerturbedMorphoMNIST(MorphoMNIST):
         else:
             self.data_path = Path(data_dir).resolve(strict=True)
 
-        images_path = self.__class__.get_images_path(self.data_path, train)
-        perturbations_args_path = \
-            self.__class__.get_perturbations_args_path(self.data_path, train)
+        images_path = self.get_images_path(self.data_path, train)
+        perturbations_args_path = (
+            self.get_perturbations_args_path(self.data_path, train)
+        )
 
         # Load dataset or generate it if it does not exits
         exists = images_path.exists() and perturbations_args_path.exists()
         if exists and not overwrite:
-            self.perturbations_args = \
+            self.perturbations_args = (
                 pd.read_csv(perturbations_args_path, index_col='index')
+            )
         elif generator is None:
             raise ValueError(
                 f"generator cannot be None when the dataset does not exist"
@@ -234,8 +298,9 @@ class PerturbedMorphoMNIST(MorphoMNIST):
 
     def __getitem__(self, index):
         item = super().__getitem__(index)
-        item['perturbations_args'] = \
+        item['perturbations_args'] = (
             self.perturbations_args.iloc[index].to_dict()
+        )
 
         return item
 
