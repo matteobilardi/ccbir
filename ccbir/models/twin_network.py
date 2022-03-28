@@ -37,7 +37,8 @@ class SimpleDeepTwinNetComponent(nn.Module):
         # is stabilised
 
         def Activation():
-            return nn.LeakyReLU(inplace=True)
+            return nn.SiLU(inplace=True)
+            #return nn.LeakyReLU(inplace=True)
 
         # NOTE: this architecture output needs to have the same shape as the
         # vq-vae encoder output
@@ -57,6 +58,9 @@ class SimpleDeepTwinNetComponent(nn.Module):
             nn.LazyConvTranspose2d(base_dim, 3, 1),
         )
         """
+
+        # conv transpose without batchnorm
+        """
         self.net = nn.Sequential(
             nn.Unflatten(1, (-1, 1, 1)),
             nn.LazyConvTranspose2d(128, 2),
@@ -70,6 +74,90 @@ class SimpleDeepTwinNetComponent(nn.Module):
             nn.LazyConvTranspose2d(32, 2),
             Activation(),
             nn.LazyConvTranspose2d(16, 2),
+        )
+        """
+
+        """
+        # a very deep convtranspose net without batchnorm (better val loss than previous)
+        self.net = nn.Sequential(
+            nn.Unflatten(1, (-1, 1, 1)),
+            nn.LazyConvTranspose2d(128, 2),
+            Activation(),
+            nn.LazyConvTranspose2d(128, 2),
+            Activation(),
+            nn.LazyConvTranspose2d(64, 2),
+            Activation(),
+            nn.LazyConvTranspose2d(64, 2),
+            Activation(),
+            nn.LazyConvTranspose2d(32, 2),
+            Activation(),
+            nn.LazyConvTranspose2d(16, 2),
+            Activation(),
+            nn.LazyConv2d(16, 3, padding=1),
+            Activation(),
+            nn.LazyConv2d(16, 3, padding=1),
+            Activation(),
+            nn.LazyConv2d(16, 3, padding=1),
+        )
+        """
+
+        """
+        self.net = nn.Sequential(
+            nn.Unflatten(1, (-1, 1, 1)),
+            nn.LazyConvTranspose2d(128, 3),
+            nn.LazyBatchNorm2d(),
+            Activation(),
+            nn.LazyConvTranspose2d(128, 3),
+            nn.LazyBatchNorm2d(),
+            Activation(),
+            nn.LazyConvTranspose2d(128, 3),
+            nn.LazyBatchNorm2d(),
+            Activation(),
+            nn.LazyConvTranspose2d(128, 3),
+            nn.LazyBatchNorm2d(),
+            Activation(),
+            nn.LazyConv2d(64, 3),
+            nn.LazyBatchNorm2d(),
+            Activation(),
+            nn.LazyConv2d(16, 1),
+            nn.LazyBatchNorm2d(),
+            Activation(),
+            nn.LazyConv2d(16, 1),
+        )
+        """
+        
+        # best so far
+        """
+        self.net = nn.Sequential(
+            nn.Unflatten(1, (-1, 1, 1)),
+            nn.LazyConvTranspose2d(128, 3),
+            Activation(),
+            nn.LazyConvTranspose2d(128, 3),
+            Activation(),
+            nn.LazyConvTranspose2d(128, 3),
+            Activation(),
+            nn.LazyConvTranspose2d(64, 3),
+            Activation(),
+            nn.LazyConv2d(64, 3),
+            Activation(),
+            nn.LazyConv2d(16, 1),
+            Activation(),
+            nn.LazyConv2d(4, 1),
+        )
+        """
+
+        # a fully linear attempt
+        self.net = nn.Sequential(
+            nn.LazyLinear(1024),
+            Activation(),
+            nn.LazyLinear(1024),
+            Activation(),
+            nn.LazyLinear(1024),
+            Activation(),
+            nn.LazyLinear(512),
+            Activation(),
+            nn.LazyLinear(196),
+            nn.Unflatten(1, (4, 7, 7))
         )
 
         self.data_dim = treatment_dim + confounders_dim
@@ -163,7 +251,7 @@ class SimpleDeepTwinNet(pl.LightningModule):
         return self.twin_net(**x)
 
     def _step(self, batch):
-        X, y = batch
+        X, y, _ = batch
 
         factual_outcome_hat, counterfactual_outcome_hat = self(X)
 
@@ -260,8 +348,6 @@ class PSFTwinNetDataset(Dataset):
         ).float()
 
     def metrics_vector(self, metrics: Dict[str, Tensor]) -> Tensor:
-        # NOTE: for now, no metric normalisation is occurring
-
         # ensure consitent order of metrics
         sorted_metrics = torch.tensor([
             metrics[metric] for metric in sorted(metrics.keys())
@@ -297,14 +383,15 @@ class PSFTwinNetDataset(Dataset):
             counterfactual_outcome=fractured_z,
         )
 
-        return x, y
+        # adding psf_item for ease of debugging but not necessary for training
+        return x, y, psf_item
 
 
 class PSFTwinNet(SimpleDeepTwinNet):
     def __init__(
         self,
         outcome_size: torch.Size,
-        lr: float = 0.0005,
+        lr: float = 0.001  # 0.0005,
     ):
         super().__init__(
             outcome_size=outcome_size,
@@ -342,9 +429,8 @@ class PSFTwinNetDataModule(MorphoMNISTDataModule):
             ]),
         )
 
-
+# TODO: find better place for this funcion
 def vqvae_embed_image(vqvae: VQVAE, image: Tensor):
-    # TODO: find better place for this funcion
     with torch.no_grad():
         # the vqvae encoder expects a 4 dimensional tensor to support
         # batching hence unsqueeze
@@ -380,6 +466,7 @@ def main():
                     monitor='val_loss',
                     filename='twinnet-{epoch:03d}-{val_loss:.7f}',
                     save_top_k=3,
+                    save_last=True,
                 ),
             ],
             max_epochs=2000,

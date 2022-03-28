@@ -3,6 +3,7 @@ import pl_bolts
 from torch.nn import Conv2d
 import pl_bolts
 
+
 class MNISTDummyVAE(pl_bolts.models.VAE):
     def __init__(self):
         super().__init__(input_height=28)

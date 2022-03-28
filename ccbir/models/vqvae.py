@@ -1,13 +1,13 @@
 from ccbir.configuration import config
 config.pythonpath_fix()
-import torch.nn.functional as F
-import torch
-import pytorch_lightning as pl
-from torchvision import transforms
-from ccbir.pytorch_vqvae.modules import VectorQuantizedVAE
-from ccbir.data.morphomnist.datamodule import MorphoMNISTDataModule
-from ccbir.data.morphomnist.dataset import LocalPerturbationsMorphoMNIST, MorphoMNIST
 from typing import Optional, Type
+from ccbir.data.morphomnist.dataset import LocalPerturbationsMorphoMNIST, MorphoMNIST
+from ccbir.data.morphomnist.datamodule import MorphoMNISTDataModule
+from ccbir.pytorch_vqvae.modules import VectorQuantizedVAE
+from torchvision import transforms
+import pytorch_lightning as pl
+import torch
+import torch.nn.functional as F
 
 
 class VQVAE(pl.LightningModule):
@@ -19,7 +19,7 @@ class VQVAE(pl.LightningModule):
         self,
         in_channels: int = 1,
         codebook_size: int = 512,         # K
-        latent_dim: int = 16,             # dimension of z
+        latent_dim: int = 4,  # 16         # dimension of z
         commit_loss_weight: float = 1.0,  # beta
         lr: float = 2e-4,
     ):
@@ -36,12 +36,12 @@ class VQVAE(pl.LightningModule):
         return self.model.forward(x)
 
     def encode(self, x):
-        """Returns discrete latent embedding e_x"""
+        """Discrete latent embedding e_x"""
         return self.model.encode(x)
 
     def encoder_net(self, x):
-        """Returns (continuous) encoder network output z_e_x i.e. before 
-        generating discrete embedding via the codebook"""
+        """(continuous) encoder network output z_e_x i.e. before generating
+        discrete embedding via the codebook"""
         return self.model.encoder(x)
 
     def decode(self, latents):
@@ -98,7 +98,7 @@ class VQVAEMorphoMNISTDataModule(MorphoMNISTDataModule):
         dataset_type: Type[MorphoMNIST] = LocalPerturbationsMorphoMNIST,
         train_batch_size: int = 64,
         test_batch_size: int = 64,
-        pin_memory: bool = True
+        pin_memory: bool = True,
     ):
         super().__init__(
             dataset_ctor=dataset_type,
@@ -132,9 +132,10 @@ def main():
                     # )),
                     filename='vqvae-morphomnist-{epoch:03d}-{val_loss:.7f}',
                     save_top_k=3,
+                    save_last=True,
                 )
             ],
-            max_epochs=100,
+            max_epochs=1000,
             gpus=1,
         ),
     )

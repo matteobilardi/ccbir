@@ -43,14 +43,17 @@ class MorphoMNIST(torchvision.datasets.VisionDataset):
         )
         assert len(images) == len(labels) and len(images) == len(metrics_df)
         self.images = images
-        self.labels: Tensor = torch.as_tensor(labels)
+
+        # copy labels so that torch doesn't complain about non-writable
+        # underlying numpy array
+        self.labels = torch.as_tensor(labels.copy())
 
         # enforce float32 metrics (instead of float64 of loaded numpy array) in
         # line with default pytorch tensors
         self.metrics = {
             metric_name: torch.tensor(
                 metric_values.values,
-                dtype=torch.float32
+                dtype=torch.float32,
             )
             for metric_name, metric_values in metrics_df.items()
         }
@@ -74,7 +77,7 @@ class MorphoMNIST(torchvision.datasets.VisionDataset):
         if scalers_file.exists():
             with open(scalers_file, 'rb') as f:
                 scaler_for_metric = pickle.load(f)
-            
+
             for scaler in scaler_for_metric.values():
                 check_is_fitted(scaler)
         else:
@@ -89,7 +92,6 @@ class MorphoMNIST(torchvision.datasets.VisionDataset):
                 scaler.fit(metric_values.view(-1, 1).numpy())
                 scaler_for_metric[metric] = scaler
 
-            # scalers_file.touch()
             scalers_file.write_bytes(pickle.dumps(scaler_for_metric))
 
         return scaler_for_metric
@@ -262,7 +264,7 @@ class PerturbedMorphoMNIST(MorphoMNIST):
             self.get_perturbations_args_path(self.data_path, train)
         )
 
-        # Load dataset or generate it if it does not exits
+        # Load dataset or generate it if it does not exist
         exists = images_path.exists() and perturbations_args_path.exists()
         if exists and not overwrite:
             self.perturbations_args = (
@@ -287,12 +289,12 @@ class PerturbedMorphoMNIST(MorphoMNIST):
 
         super().__init__(data_dir=str(self.data_path), train=train, **kwargs)
 
-    @ staticmethod
+    @staticmethod
     def get_perturbations_args_path(data_path: Path, train: bool) -> Path:
         prefix = "train" if train else "t10k"
         return data_path / f"{prefix}-perturbations-args.csv"
 
-    @ property
+    @property
     def perturbation_name(self) -> str:
         return str(self.perturbation_type.__name__).lower()
 
