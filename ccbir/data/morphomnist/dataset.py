@@ -2,6 +2,7 @@
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_is_fitted
 from torch import Tensor
+from torch.utils.data import default_collate
 import torch
 from ccbir.configuration import config
 from ccbir.data.morphomnist.perturbsampler import FractureSampler, PerturbationSampler, SwellingSampler
@@ -35,13 +36,14 @@ class MorphoMNIST(torchvision.datasets.VisionDataset):
 
         self.data_dir = data_dir
         self.train = train
-        
+
         images, labels, metrics_df = load_morphomnist_like(
             root_dir=data_dir,
             train=train,
             columns=None  # include all metrics available
         )
         assert len(images) == len(labels) and len(images) == len(metrics_df)
+
         self.images = images
 
         # copy labels so that torch doesn't complain about non-writable
@@ -116,11 +118,15 @@ class MorphoMNIST(torchvision.datasets.VisionDataset):
         return len(self.images)
 
     def __getitem__(self, index):
-        # enforce PIL image format consistent format with tochvision datasets
-        image = PIL.Image.fromarray(self.images[index], mode='L')
+        image = self.images[index]
 
         if self.transform is not None:
-            image = self.transform(image)
+            if isinstance(index, slice):
+                # some torchvision transforms don't support batching so handle
+                # slices explictly (and slowly)
+                image = default_collate(list(map(self.transform, image)))
+            else:
+                image = self.transform(image)
 
         metrics = {k: v[index] for k, v in self.metrics.items()}
 

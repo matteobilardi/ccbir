@@ -19,6 +19,7 @@ from deepscm.submodules.morphomnist.morphomnist.perturb import Perturbation
 from more_itertools import interleave
 import pandas as pd
 import seaborn as sns
+from torch.utils.data import Dataset
 
 
 def pil_from_tensor(tensor):
@@ -35,6 +36,7 @@ def show_tensor(tensor_img, dpi=150):
 
 
 class ExperimentData:
+
     def __init__(
         self,
         datamodule_ctor: Union[
@@ -54,21 +56,19 @@ class ExperimentData:
         return dm
 
     @cached_property
-    def _train_data(self):
+    def _train_dataset(self):
         dm = self.datamodule
-        print('Loading training data...')
         dataset = dm.train_dataloader().dataset
-        return default_collate(list(dataset))
+        return dataset
 
     @cached_property
-    def _test_data(self):
+    def _test_dataset(self):
         dm = self.datamodule
-        print('Loading test data...')
         dataset = dm.test_dataloader().dataset
-        return default_collate(list(dataset))
+        return dataset
 
-    def batched(self, train: bool) -> Any:
-        return self._train_data if train else self._test_data
+    def dataset(self, train: bool) -> Dataset:
+        return self._train_dataset if train else self._test_dataset
 
 
 class VQVAEExperiment:
@@ -85,8 +85,8 @@ class VQVAEExperiment:
         )
 
     def show_vqvae_recons(self, num_images: int = 32, train: bool = False):
-        data = self.data.batched(train)
-        images = data['image'][:num_images]
+        data = self.data.dataset(train)[:num_images]
+        images = data['image']
 
         with torch.no_grad():
             recons, _z_e, _z_q = self.vqvae(images)
@@ -115,14 +115,15 @@ class VQVAEExperiment:
         assert len(include_perturbations) > 0
         perturbations = sorted(include_perturbations)
 
-        _x, _y, psf_items = self.psf_data.batched(train)
+        _x, _y, psf_items = self.psf_data.dataset(train)[:num_points]
 
         # concat z_q of all perturbations to compute TSNE for all embeddings
         z_q_all = torch.cat([
             self._vqvae_z_q(
-                psf_items[perturbation]['image'][:num_points]
+                psf_items[perturbation]['image']
             )
-            for perturbation in perturbations
+            # FIXME: hacky fix to handle batchesturbations
+            for perturbation in per
         ])
 
         print('Computing TSNE...')
@@ -131,12 +132,13 @@ class VQVAEExperiment:
             # latents need to be flattened to vectors to be processed by TSNE
             z_q_all.flatten(start_dim=1).detach().numpy()
         ))
+
         z_q_embedded_for_perturbation = dict(zip(
             perturbations,
             torch.chunk(z_q_embedded_all, len(perturbations)),
         ))
 
-        labels = psf_items['plain']['label'][:num_points]
+        labels = psf_items['plain']['label']
 
         df = pd.concat((
             pd.DataFrame(dict(
@@ -152,7 +154,7 @@ class VQVAEExperiment:
         df = df.sort_values(by=['digit', 'perturbation'])
 
         plt.figure(dpi=200)
-        #sns.set_style('white')
+        # sns.set_style('white')
         g = sns.scatterplot(
             data=df,
             x='x',
@@ -164,7 +166,6 @@ class VQVAEExperiment:
         )
         g.legend(loc='center left', bbox_to_anchor=(1, 0.5))
         g.set(title=f"TSNE: {perplexity=}, {n_iter=}")
-
 
 
 class PSFTwinNetExperiment:
@@ -197,18 +198,17 @@ class PSFTwinNetExperiment:
         self,
         item_idx: int,
         num_samples=32,
-        noise_rescale: float = 1.0,
+        noise_scale: float = 0.25,
         train=False,
     ):
-        batch = self.data.batched(train)
-        X, y, psf_item = batch
+        X, y, psf_item = self.data.dataset(train)[item_idx]
 
-        original_image = psf_item['plain']['image'][item_idx].unsqueeze(0)
-        swollen_image = psf_item['swollen']['image'][item_idx].unsqueeze(0)
-        fractured_image = psf_item['fractured']['image'][item_idx].unsqueeze(0)
-        swollen_embedding = y['factual_outcome'][item_idx].unsqueeze(0)
+        original_image = psf_item['plain']['image'].unsqueeze(0)
+        swollen_image = psf_item['swollen']['image'].unsqueeze(0)
+        fractured_image = psf_item['fractured']['image'].unsqueeze(0)
+        swollen_embedding = y['factual_outcome'].unsqueeze(0)
         fractured_embedding = (
-            y['counterfactual_outcome'][item_idx].unsqueeze(0)
+            y['counterfactual_outcome'].unsqueeze(0)
         )
 
         ground_truths = torch.cat((
@@ -229,17 +229,18 @@ class PSFTwinNetExperiment:
         # repeat input num_samples time
         X = {
             k: (
-                v[item_idx]
-                .unsqueeze(0)
+                v.unsqueeze(0)
                 .clone()
                 .repeat_interleave(num_samples, dim=0)
             )
             for k, v in X.items()
         }
 
-        # resample noise, possibly rescaling it for higher/lower variance
-        X['outcome_noise'] = (
-            torch.randn_like(X['outcome_noise']) * noise_rescale
+        # resample noise, possibly with differen scale for higher/lower
+        # variance
+        X['outcome_noise'] = PSFTwinNetDataset.sample_outcome_noise(
+            sample_shape=X['outcome_noise'].shape,
+            scale=noise_scale,
         )
 
         swollen_embedding_hat, fractured_embedding_hat = self.twinnet(X)

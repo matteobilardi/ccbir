@@ -16,6 +16,7 @@ from ccbir.data.morphomnist.dataset import (
 from ccbir.data.morphomnist.datamodule import MorphoMNISTDataModule
 from ccbir.data.dataset import CombinedDataset
 from ccbir.configuration import config
+from torch.distributions import Normal
 config.pythonpath_fix()
 
 
@@ -30,19 +31,32 @@ class SimpleDeepTwinNetComponent(nn.Module):
         outcome_noise_dim: int,
         outcome_shape: torch.Size,
         noise_inject_mode: Literal['concat', 'add', 'multiply'] = 'concat',
+        use_combine_net: bool = False,
     ):
         super().__init__()
+        self.use_combine_net = use_combine_net
+        self.data_dim = treatment_dim + confounders_dim
 
-        # TODO: For clarity consider not using lazy layers once the architecture
-        # is stabilised
+        if noise_inject_mode == 'concat':
+            self.input_dim = self.data_dim * 2
+            self.inject_noise = (
+                lambda data, noise: torch.concat((data, noise), dim=1)
+            )
+        elif noise_inject_mode == 'add':
+            self.input_dim = self.data_dim
+            self.inject_noise = torch.add
+        elif noise_inject_mode == 'multiply':
+            self.input_dim = self.data_dim
+            self.inject_noise = torch.mul
+        else:
+            raise TypeError(f"Invalid {noise_inject_mode=}")
 
         def Activation():
             return nn.SiLU(inplace=True)
-            #return nn.LeakyReLU(inplace=True)
+            # return nn.LeakyReLU(inplace=True)
 
-        # NOTE: this architecture output needs to have the same shape as the
-        # vq-vae encoder output
-        base_dim = outcome_shape[0]
+        # TODO: For clarity consider not using lazy layers once the architecture
+        # is stabilised
 
         """
         self.net = nn.Sequential(
@@ -125,9 +139,8 @@ class SimpleDeepTwinNetComponent(nn.Module):
             nn.LazyConv2d(16, 1),
         )
         """
-        
+
         # best so far
-        """
         self.net = nn.Sequential(
             nn.Unflatten(1, (-1, 1, 1)),
             nn.LazyConvTranspose2d(128, 3),
@@ -144,8 +157,9 @@ class SimpleDeepTwinNetComponent(nn.Module):
             Activation(),
             nn.LazyConv2d(4, 1),
         )
-        """
 
+
+        """
         # a fully linear attempt
         self.net = nn.Sequential(
             nn.LazyLinear(1024),
@@ -159,43 +173,49 @@ class SimpleDeepTwinNetComponent(nn.Module):
             nn.LazyLinear(196),
             nn.Unflatten(1, (4, 7, 7))
         )
+        """
 
-        self.data_dim = treatment_dim + confounders_dim
-
-        if noise_inject_mode == 'concat':
-            self.input_dim = self.data_dim * 2
-            self.inject_noise = (
-                lambda data, noise: torch.concat((data, noise), dim=1)
-            )
-        elif noise_inject_mode == 'add':
-            self.input_dim = self.data_dim
-            self.inject_noise = torch.add
-        elif noise_inject_mode == 'multiply':
-            self.input_dim = self.data_dim
-            self.inject_noise = torch.mul
-        else:
-            raise TypeError(f"Invalid {noise_inject_mode=}")
+        self.combine_treatment_confounders_net = nn.Sequential(
+            nn.LazyLinear(self.data_dim),
+            Activation(),
+            nn.LazyLinear(self.data_dim),
+        )
 
         # NOTE: to inject noise via multiplication/addition, we currently force
         # the reparametrised noise to have the same number of dimensions as the
         # data (i.e. [treatement, confounders]) regardless of the value of
         # outcome_noise_dim, which is just the size of the input to the
-        # reparametrize_noise_net. For pure convenience, currentll this is the
+        # reparametrize_noise_net. For pure convenience, currently this is the
         # case even when we inject noise by concatenation
         self.reparametrize_noise_net = nn.Sequential(
-            # For now just a linear layer, but might need something with more
-            # representation power
+            nn.LazyLinear(self.data_dim),
+            Activation(),
             nn.LazyLinear(self.data_dim),
         )
 
         # force lazy init
+        dummy_X_Z_output = self.combine_treatment_confounders_net(
+            torch.rand(1, self.data_dim)
+        )
         dummy_noise_output = self.reparametrize_noise_net(
             torch.rand(1, outcome_noise_dim)
         )
         dummy_output = self.net(torch.rand(1, self.input_dim))
 
+        assert dummy_X_Z_output.shape[1] == self.data_dim
         assert dummy_noise_output.shape[1] == self.data_dim
         assert dummy_output.shape[1:] == outcome_shape
+
+    def combine_treatment_confounders(
+        self,
+        treatment: Tensor,
+        confounders: Tensor,
+    ) -> Tensor:
+        combined = torch.cat((treatment, confounders), dim=1)
+        if self.use_combine_net:
+            combined = self.combine_treatment_confounders_net(combined)
+
+        return combined
 
     def forward(
         self,
@@ -205,16 +225,18 @@ class SimpleDeepTwinNetComponent(nn.Module):
         outcome_noise: Tensor,
     ) -> Tuple[Tensor, Tensor]:
 
-        factual_data = torch.cat(
-            (factual_treatment, confounders),
-            dim=1
+        factual_data = self.combine_treatment_confounders(
+            factual_treatment,
+            confounders,
         )
-        counterfactual_data = torch.cat(
-            (counterfactual_treatment, confounders),
-            dim=1,
+
+        counterfactual_data = self.combine_treatment_confounders(
+            counterfactual_treatment,
+            confounders
         )
 
         noise = self.reparametrize_noise_net(outcome_noise)
+
         factual_input = self.inject_noise(factual_data, noise)
         counterfactual_input = self.inject_noise(counterfactual_data, noise)
 
@@ -322,9 +344,17 @@ class PSFTwinNetDataset(Dataset):
             fractured=FracturedMorphoMNIST(**kwargs),
         ))
 
-        self.outcome_noise = torch.randn(
-            (len(self.psf_dataset), self.outcome_noise_dim),
+        self.outcome_noise = self.sample_outcome_noise(
+            sample_shape=(len(self.psf_dataset), self.outcome_noise_dim),
         )
+
+    @classmethod
+    def sample_outcome_noise(
+        cls,
+        sample_shape: torch.Size,
+        scale: float = 0.25,
+    ) -> Tensor:
+        return (Normal(0, scale).sample(sample_shape) % 1) + 1
 
     def treatment_to_index(self, treatment: str) -> int:
         try:
@@ -349,9 +379,13 @@ class PSFTwinNetDataset(Dataset):
 
     def metrics_vector(self, metrics: Dict[str, Tensor]) -> Tensor:
         # ensure consitent order of metrics
-        sorted_metrics = torch.tensor([
-            metrics[metric] for metric in sorted(metrics.keys())
-        ])
+        sorted_metrics = torch.cat(
+            tensors=[
+                metrics[metric].unsqueeze(-1)
+                for metric in sorted(metrics.keys())
+            ],
+            dim=-1,
+        )
 
         return sorted_metrics
 
@@ -366,7 +400,7 @@ class PSFTwinNetDataset(Dataset):
         fracture = self.one_hot_treatment('fracture')
         label = self.one_hot_label(psf_item['plain']['label'])
         metrics = self.metrics_vector(psf_item['plain']['metrics'])
-        label_and_metrics = torch.cat((label, metrics))
+        label_and_metrics = torch.cat((label, metrics), dim=-1)
 
         x = dict(
             factual_treatment=swell,
@@ -391,7 +425,7 @@ class PSFTwinNet(SimpleDeepTwinNet):
     def __init__(
         self,
         outcome_size: torch.Size,
-        lr: float = 0.001  # 0.0005,
+        lr: float = 0.0005,
     ):
         super().__init__(
             outcome_size=outcome_size,
@@ -429,12 +463,18 @@ class PSFTwinNetDataModule(MorphoMNISTDataModule):
             ]),
         )
 
+
 # TODO: find better place for this funcion
 def vqvae_embed_image(vqvae: VQVAE, image: Tensor):
     with torch.no_grad():
         # the vqvae encoder expects a 4 dimensional tensor to support
         # batching hence unsqueeze
-        return vqvae.encoder_net(image.unsqueeze(0)).squeeze(0)
+        if image.dim() == 3:
+            return vqvae.encoder_net(image.unsqueeze(0)).squeeze(0)
+        elif image.dim() == 4:
+            return vqvae.encoder_net(image)
+        else:
+            raise ValueError(f"{image.dim()=} but must be 3 or 4")
 
 
 def main():
