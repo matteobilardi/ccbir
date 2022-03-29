@@ -18,6 +18,7 @@ import pytorch_lightning as pl
 from deepscm.submodules.morphomnist.morphomnist.perturb import Perturbation
 from more_itertools import interleave
 import pandas as pd
+import seaborn as sns
 
 
 def pil_from_tensor(tensor):
@@ -86,7 +87,7 @@ class VQVAEExperiment:
     def show_vqvae_recons(self, num_images: int = 32, train: bool = False):
         data = self.data.batched(train)
         images = data['image'][:num_images]
-        
+
         with torch.no_grad():
             recons, _z_e, _z_q = self.vqvae(images)
 
@@ -107,6 +108,7 @@ class VQVAEExperiment:
             'plain', 'swollen', 'fractured'
         ]] = ['plain', 'swollen', 'fractured'],
         perplexity: int = 30,
+        n_iter: int = 1000,
         num_points: int = 500,
         train: bool = False,
     ):
@@ -131,33 +133,38 @@ class VQVAEExperiment:
         ))
         z_q_embedded_for_perturbation = dict(zip(
             perturbations,
-            torch.chunk(z_q_embedded_all, len(perturbations))
+            torch.chunk(z_q_embedded_all, len(perturbations)),
         ))
 
         labels = psf_items['plain']['label'][:num_points]
 
+        df = pd.concat((
+            pd.DataFrame(dict(
+                perturbation=[perturbation] * len(z_q_embedded),
+                digit=labels,
+                x=z_q_embedded[:, 0],
+                y=z_q_embedded[:, 1],
+            ))
+            for perturbation, z_q_embedded in
+            z_q_embedded_for_perturbation.items()
+        ))
 
-        data = pd.DataFrame({
-            'digit': labels,
-            **z_q_embedded_for_perturbation
-        })
+        df = df.sort_values(by=['digit', 'perturbation'])
 
+        plt.figure(dpi=200)
+        #sns.set_style('white')
+        g = sns.scatterplot(
+            data=df,
+            x='x',
+            y='y',
+            hue='digit',
+            style='perturbation',
+            legend='full',
+            palette='bright',
+        )
+        g.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+        g.set(title=f"TSNE: {perplexity=}, {n_iter=}")
 
-        """
-        plt.gca().set_aspect('auto', 'box')
-
-        for perturbation in perturbations:
-            z_q_embedded = z_q_embedded_for_perturbation[perturbation]
-            for digit in range(10):
-                embedding_for_digit = z_q_embedded[labels == digit]
-                x = embedding_for_digit[:, 0]
-                y = embedding_for_digit[:, 1]
-                plt.scatter(x, y, label=f"{digit}-{perturbation}")
-
-        plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
-        plt.figure()
-        plt.show()
-        """
 
 
 class PSFTwinNetExperiment:
