@@ -21,6 +21,8 @@ import pandas as pd
 import seaborn as sns
 from torch.utils.data import Dataset
 
+# TODO: rename file
+
 
 def pil_from_tensor(tensor):
     return transforms.ToPILImage()(tensor)
@@ -36,6 +38,8 @@ def show_tensor(tensor_img, dpi=150):
 
 
 class ExperimentData:
+    """Provides convenient and fast access to the exact databases used by a
+    datamodule"""
 
     def __init__(
         self,
@@ -122,8 +126,7 @@ class VQVAEExperiment:
             self._vqvae_z_q(
                 psf_items[perturbation]['image']
             )
-            # FIXME: hacky fix to handle batchesturbations
-            for perturbation in per
+            for perturbation in perturbations
         ])
 
         print('Computing TSNE...')
