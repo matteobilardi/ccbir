@@ -33,10 +33,12 @@ class SimpleDeepTwinNetComponent(nn.Module):
         outcome_shape: torch.Size,
         noise_inject_mode: Literal['concat', 'add', 'multiply'] = 'multiply',
         use_combine_net: bool = True,
+        weight_sharing: bool = False,
     ):
         super().__init__()
         self.use_combine_net = use_combine_net
         self.data_dim = treatment_dim + confounders_dim
+        self.weight_sharing = weight_sharing
 
         if noise_inject_mode == 'concat':
             self.input_dim = self.data_dim * 2
@@ -161,7 +163,8 @@ class SimpleDeepTwinNetComponent(nn.Module):
             nn.LazyConv2d(4, 1),
         )
         """
-
+        
+        """
         # a fully linear attempt (version 66 checkpoint)
         # best of ll so far (MSE loss at 0.09-0.1)
         self.net = nn.Sequential(
@@ -176,6 +179,7 @@ class SimpleDeepTwinNetComponent(nn.Module):
             nn.LazyLinear(196),
             nn.Unflatten(1, (4, 7, 7))
         )
+        """
 
         """
         # a shallower fully linear attempt
@@ -193,9 +197,9 @@ class SimpleDeepTwinNetComponent(nn.Module):
             nn.LazyLinear(self.data_dim),
             Activation(),
             nn.LazyLinear(self.data_dim),
-        )
+        ) if use_combine_net else None
 
-        # NOTE: to inject noise via multiplication/addition, we currently force
+        # to inject noise via multiplication/addition, we currently force
         # the reparametrised noise to have the same number of dimensions as the
         # data (i.e. [treatement, confounders]) regardless of the value of
         # outcome_noise_dim, which is just the size of the input to the
@@ -207,6 +211,25 @@ class SimpleDeepTwinNetComponent(nn.Module):
             nn.LazyLinear(self.data_dim),
         )
 
+        def make_branch():
+            return nn.Sequential(
+                nn.LazyLinear(1024),
+                Activation(),
+                nn.LazyLinear(1024),
+                Activation(),
+                nn.LazyLinear(1024),
+                Activation(),
+                nn.LazyLinear(512),
+                Activation(),
+                nn.LazyLinear(196),
+                nn.Unflatten(1, (4, 7, 7))
+            )
+
+        self.factual_branch = make_branch()
+        self.counterfactual_branch = (
+            self.factual_branch if weight_sharing else make_branch()
+        )
+
         # force lazy init
         dummy_X_Z_output = self.combine_treatment_confounders_net(
             torch.rand(1, self.data_dim)
@@ -214,11 +237,15 @@ class SimpleDeepTwinNetComponent(nn.Module):
         dummy_noise_output = self.reparametrize_noise_net(
             torch.rand(1, outcome_noise_dim)
         )
-        dummy_output = self.net(torch.rand(1, self.input_dim))
+        dummy_output_fact = self.factual_branch(torch.rand(1, self.input_dim))
+        dummy_output_counterfact = (
+            self.counterfactual_branch(torch.rand(1, self.input_dim))
+        )
 
         assert dummy_X_Z_output.shape[1] == self.data_dim
         assert dummy_noise_output.shape[1] == self.data_dim
-        assert dummy_output.shape[1:] == outcome_shape
+        assert dummy_output_fact.shape[1:] == outcome_shape
+        assert dummy_output_counterfact.shape[1:] == outcome_shape
 
     def combine_treatment_confounders(
         self,
@@ -254,11 +281,12 @@ class SimpleDeepTwinNetComponent(nn.Module):
         factual_input = self.inject_noise(factual_data, noise)
         counterfactual_input = self.inject_noise(counterfactual_data, noise)
 
-        # for now, just have a single network so as to implicitly enforce
-        # weight sharing between the factual and counterfactual branches of the
-        # twin network
-        factual_outcome = self.net(factual_input)
-        counterfactual_outcome = self.net(counterfactual_input)
+        # factual_branch and counterfactual_branch are the same network
+        # when weight sharing is on
+        factual_outcome = self.factual_branch(factual_input)
+        counterfactual_outcome = (
+            self.counterfactual_branch(counterfactual_input)
+        )
 
         return factual_outcome, counterfactual_outcome
 
@@ -294,8 +322,6 @@ class SimpleDeepTwinNet(pl.LightningModule):
         factual_outcome = y['factual_outcome']
         counterfactual_outcome = y['counterfactual_outcome']
 
-        # NOTE: loss is calculated on the continous encoder outputs
-        # before vector quantization into a discrete representation
         factual_loss = F.mse_loss(factual_outcome_hat, factual_outcome)
         counterfactual_loss = F.mse_loss(
             counterfactual_outcome_hat,
@@ -362,6 +388,8 @@ class PSFTwinNetDataset(Dataset):
             sample_shape=(len(self.psf_dataset), self.outcome_noise_dim),
         )
 
+
+    # TODO: consider moving to DataModule
     @classmethod
     def sample_outcome_noise(
         cls,

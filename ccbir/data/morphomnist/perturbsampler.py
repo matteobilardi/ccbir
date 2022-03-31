@@ -13,7 +13,7 @@ class PerturbationSampler:
         self.perturbation_type = perturbation_type
 
     def sample_args(self, num_samples: int) -> pd.DataFrame:
-        raise NotImplementedError()
+        raise NotImplementedError
 
     def sample(
         self,
