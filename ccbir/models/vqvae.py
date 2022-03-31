@@ -124,7 +124,6 @@ class VQVAEMorphoMNISTDataModule(MorphoMNISTDataModule):
             test_batch_size=test_batch_size,
             pin_memory=pin_memory,
             transform=transforms.Compose([
-                transforms.ToTensor(),
                 # enforce range [-1, 1] in line with tanh NN output
                 # see https://discuss.pytorch.org/t/understanding-transform-normalize/21730/2
                 transforms.Normalize(mean=0.5, std=0.5)

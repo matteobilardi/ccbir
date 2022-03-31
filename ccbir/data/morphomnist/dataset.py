@@ -4,6 +4,7 @@ from sklearn.utils.validation import check_is_fitted
 from torch import Tensor
 from torch.utils.data import default_collate
 import torch
+from ccbir.tranforms import from_numpy_image
 from ccbir.configuration import config
 from ccbir.data.morphomnist.perturbsampler import FractureSampler, PerturbationSampler, SwellingSampler
 from deepscm.datasets.morphomnist import MorphoMNISTLike, load_morphomnist_like, save_morphomnist_like
@@ -26,11 +27,13 @@ class MorphoMNIST(torchvision.datasets.VisionDataset):
 
     def __init__(
         self,
-        data_dir: str,
         *,
+        data_dir: str,
         train: bool,
         transform=None,
         normalize_metrics: bool = False,
+        binarize: bool = False,
+        to_tensor: bool = True,
     ):
         super().__init__(root=data_dir, transform=transform)
 
@@ -44,11 +47,27 @@ class MorphoMNIST(torchvision.datasets.VisionDataset):
         )
         assert len(images) == len(labels) and len(images) == len(metrics_df)
 
-        self.images = images
+        self.images = images.copy()
+
+        if to_tensor:
+            self.images = from_numpy_image(self.images, has_channel_dim=False)
+
+        if binarize:
+            if not to_tensor:
+                raise ValueError(
+                    f"{to_tensor=} but must be True when binarize is True"
+                )
+
+            # it's important to stochastically binarize the dataset only once
+            # (i.e. not in __getitem__) otherwise repeated sampling is akin
+            # to introducing regularisation to the dataset itself and would
+            # cause an unfair evaluation of performance. Hence, this can't
+            # be done by passing a stochastic transform.
+            self.images = torch.bernoulli(self.images)
 
         # copy labels so that torch doesn't complain about non-writable
         # underlying numpy array
-        self.labels = torch.as_tensor(labels.copy())
+        self.labels = torch.from_numpy(labels.copy())
 
         # enforce float32 metrics (instead of float64 of loaded numpy array) in
         # line with default pytorch tensors
@@ -69,21 +88,21 @@ class MorphoMNIST(torchvision.datasets.VisionDataset):
         if self.train:
             return self.metrics
         else:
-            return self.__class__(self.data_dir, train=True).metrics
+            return self.__class__(data_dir=self.data_dir, train=True).metrics
 
-    def _load_scalers(self) -> Dict[str, StandardScaler]:
+    def _load_scalers(self, recompute=True) -> Dict[str, StandardScaler]:
+        # TODO: consider removing saving to file entirely
         scalers_file = Path(self.root) / 'metrics_scalers.pkl'
 
         # load from disk scalers for each metric if they exits, otherwise fit
         # new scalers and save them to disk for future use
-        if scalers_file.exists():
+        if scalers_file.exists() and not recompute:
             with open(scalers_file, 'rb') as f:
                 scaler_for_metric = pickle.load(f)
 
             for scaler in scaler_for_metric.values():
                 check_is_fitted(scaler)
         else:
-
             # never fit a scaler on the test data!
             fittable_metrics = self._raw_training_metrics()
 
@@ -179,7 +198,7 @@ class PerturbedMorphoMNISTGenerator:
     def _perturb_image(
         self,
         perturbation_and_image: Tuple[Perturbation, np.ndarray]
-    ):
+    ) -> np.ndarray:
         perturbation, image = perturbation_and_image
         morph = ImageMorphology(image, self._THRESHOLD, self._UP_FACTOR)
         perturbed_image = morph.downscale(perturbation(morph))
@@ -250,9 +269,9 @@ class PerturbedMorphoMNIST(MorphoMNIST):
     def __init__(
         self,
         perturbation_type: Type[Perturbation],
+        *,
         data_dir: Optional[str] = None,
         generator: Optional[PerturbedMorphoMNISTGenerator] = None,
-        *,
         train: bool,
         overwrite: bool = False,
         **kwargs,
@@ -350,4 +369,4 @@ class LocalPerturbationsMorphoMNIST(MorphoMNIST):
         data_dir: str = str(config.local_morphomnist_data_path),
         **kwargs,
     ):
-        super().__init__(data_dir, **kwargs)
+        super().__init__(data_dir=data_dir, **kwargs)
