@@ -1,6 +1,6 @@
 from ccbir.configuration import config
 config.pythonpath_fix()
-from typing import Optional, Type
+from typing import Callable, Literal, Optional, Type
 from ccbir.data.morphomnist.dataset import LocalPerturbationsMorphoMNIST, MorphoMNIST
 from ccbir.data.morphomnist.datamodule import MorphoMNISTDataModule
 from ccbir.pytorch_vqvae.modules import VectorQuantizedVAE
@@ -8,6 +8,7 @@ from torchvision import transforms
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
+from torch import Tensor
 
 
 class VQVAE(pl.LightningModule):
@@ -44,8 +45,25 @@ class VQVAE(pl.LightningModule):
         discrete embedding via the codebook"""
         return self.model.encoder(x)
 
-    def decode(self, latents):
-        return self.model.decode(latents)
+    def decode(self, e_x):
+        return self.model.decode(e_x)
+
+    def embed(
+        self,
+        x: Tensor,
+        latent_type: Literal['encoder_output', 'discrete', 'decoder_input'],
+    ) -> Tensor:
+        if latent_type == 'encoder_output':
+            z_e_x = self.model.encoder(x)
+            return z_e_x
+        elif latent_type == 'discrete':
+            e_x = self.encode(x)
+            return e_x
+        elif latent_type == 'decoder_input':
+            _x_hat, _z_e_x, z_q_x = self(x)
+            return z_q_x
+        else:
+            raise ValueError(f'Invalid {latent_type=}')
 
     def _prep_batch(self, batch):
         x = batch['image']
@@ -64,7 +82,7 @@ class VQVAE(pl.LightningModule):
 
         loss = loss_recon + loss_vq + self.commit_loss_weight * loss_commit
 
-        # not reporting loss_vq since it's identical to loss_commit
+        # not reporting loss_commit since it's identical to loss_vq
         metrics = {
             'loss': loss,
             'loss_recon': loss_recon,

@@ -6,6 +6,7 @@ from typing import Callable, Dict, Literal, Mapping, Optional, Tuple
 from torchvision import transforms
 from torch import Tensor, embedding, nn
 from functools import partial
+from ccbir.util import support_unbatched
 from ccbir.models.vqvae import VQVAE
 from ccbir.models.model import load_best_model
 from ccbir.data.morphomnist.dataset import (
@@ -30,8 +31,8 @@ class SimpleDeepTwinNetComponent(nn.Module):
         confounders_dim: int,
         outcome_noise_dim: int,
         outcome_shape: torch.Size,
-        noise_inject_mode: Literal['concat', 'add', 'multiply'] = 'concat',
-        use_combine_net: bool = False,
+        noise_inject_mode: Literal['concat', 'add', 'multiply'] = 'multiply',
+        use_combine_net: bool = True,
     ):
         super().__init__()
         self.use_combine_net = use_combine_net
@@ -40,7 +41,7 @@ class SimpleDeepTwinNetComponent(nn.Module):
         if noise_inject_mode == 'concat':
             self.input_dim = self.data_dim * 2
             self.inject_noise = (
-                lambda data, noise: torch.concat((data, noise), dim=1)
+                lambda data, noise: torch.cat((data, noise), dim=-1)
             )
         elif noise_inject_mode == 'add':
             self.input_dim = self.data_dim
@@ -52,6 +53,7 @@ class SimpleDeepTwinNetComponent(nn.Module):
             raise TypeError(f"Invalid {noise_inject_mode=}")
 
         def Activation():
+            # return nn.ReLU(inplace=True)
             return nn.SiLU(inplace=True)
             # return nn.LeakyReLU(inplace=True)
 
@@ -140,7 +142,8 @@ class SimpleDeepTwinNetComponent(nn.Module):
         )
         """
 
-        # best so far
+        """
+        # best conv so far
         self.net = nn.Sequential(
             nn.Unflatten(1, (-1, 1, 1)),
             nn.LazyConvTranspose2d(128, 3),
@@ -157,10 +160,10 @@ class SimpleDeepTwinNetComponent(nn.Module):
             Activation(),
             nn.LazyConv2d(4, 1),
         )
-
-
         """
-        # a fully linear attempt
+
+        # a fully linear attempt (version 66 checkpoint)
+        # best of ll so far (MSE loss at 0.09-0.1)
         self.net = nn.Sequential(
             nn.LazyLinear(1024),
             Activation(),
@@ -169,6 +172,17 @@ class SimpleDeepTwinNetComponent(nn.Module):
             nn.LazyLinear(1024),
             Activation(),
             nn.LazyLinear(512),
+            Activation(),
+            nn.LazyLinear(196),
+            nn.Unflatten(1, (4, 7, 7))
+        )
+
+        """
+        # a shallower fully linear attempt
+        self.net = nn.Sequential(
+            nn.LazyLinear(1024),
+            Activation(),
+            nn.LazyLinear(1024),
             Activation(),
             nn.LazyLinear(196),
             nn.Unflatten(1, (4, 7, 7))
@@ -211,7 +225,7 @@ class SimpleDeepTwinNetComponent(nn.Module):
         treatment: Tensor,
         confounders: Tensor,
     ) -> Tensor:
-        combined = torch.cat((treatment, confounders), dim=1)
+        combined = torch.cat((treatment, confounders), dim=-1)
         if self.use_combine_net:
             combined = self.combine_treatment_confounders_net(combined)
 
@@ -374,7 +388,7 @@ class PSFTwinNetDataset(Dataset):
     def one_hot_label(self, label: Tensor) -> Tensor:
         return F.one_hot(
             label.long(),
-            num_classes=len(self.labels)
+            num_classes=len(self.labels),
         ).float()
 
     def metrics_vector(self, metrics: Dict[str, Tensor]) -> Tensor:
@@ -447,6 +461,7 @@ class PSFTwinNetDataModule(MorphoMNISTDataModule):
         embed_image: Callable[[Tensor], Tensor],
         train_batch_size: int = 64,
         test_batch_size: int = 64,
+        pin_memory: bool = True,
     ):
 
         super().__init__(
@@ -456,7 +471,7 @@ class PSFTwinNetDataModule(MorphoMNISTDataModule):
             ),
             train_batch_size=train_batch_size,
             test_batch_size=test_batch_size,
-            pin_memory=True,
+            pin_memory=pin_memory,
             transform=transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize(mean=0.5, std=0.5),
@@ -466,15 +481,13 @@ class PSFTwinNetDataModule(MorphoMNISTDataModule):
 
 # TODO: find better place for this funcion
 def vqvae_embed_image(vqvae: VQVAE, image: Tensor):
+    embed = support_unbatched(partial(
+        vqvae.embed,
+        latent_type='decoder_input',
+    ))
+
     with torch.no_grad():
-        # the vqvae encoder expects a 4 dimensional tensor to support
-        # batching hence unsqueeze
-        if image.dim() == 3:
-            return vqvae.encoder_net(image.unsqueeze(0)).squeeze(0)
-        elif image.dim() == 4:
-            return vqvae.encoder_net(image)
-        else:
-            raise ValueError(f"{image.dim()=} but must be 3 or 4")
+        return embed(image)
 
 
 def main():
