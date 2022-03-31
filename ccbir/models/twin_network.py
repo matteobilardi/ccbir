@@ -6,6 +6,7 @@ from typing import Callable, Dict, Literal, Mapping, Optional, Tuple
 from torchvision import transforms
 from torch import Tensor, embedding, nn
 from functools import partial
+from ccbir.tranforms import DictTransform
 from ccbir.util import support_unbatched
 from ccbir.models.vqvae import VQVAE
 from ccbir.models.model import load_best_model
@@ -15,7 +16,7 @@ from ccbir.data.morphomnist.dataset import (
     SwollenMorphoMNIST
 )
 from ccbir.data.morphomnist.datamodule import MorphoMNISTDataModule
-from ccbir.data.dataset import CombinedDataset
+from ccbir.data.dataset import ZipDataset
 from ccbir.configuration import config
 from torch.distributions import Normal
 config.pythonpath_fix()
@@ -163,7 +164,7 @@ class SimpleDeepTwinNetComponent(nn.Module):
             nn.LazyConv2d(4, 1),
         )
         """
-        
+
         """
         # a fully linear attempt (version 66 checkpoint)
         # best of ll so far (MSE loss at 0.09-0.1)
@@ -211,6 +212,9 @@ class SimpleDeepTwinNetComponent(nn.Module):
             nn.LazyLinear(self.data_dim),
         )
 
+
+        # NOTE: so far best architecture: obtained  MSE ~0.075, without
+        # weight sharing, beating previous best (version 75)
         def make_branch():
             return nn.Sequential(
                 nn.LazyLinear(1024),
@@ -378,7 +382,7 @@ class PSFTwinNetDataset(Dataset):
             transform=transform,
             normalize_metrics=normalize_metrics
         )
-        self.psf_dataset = CombinedDataset(dict(
+        self.psf_dataset = ZipDataset(dict(
             plain=PlainMorphoMNIST(**kwargs),
             swollen=SwollenMorphoMNIST(**kwargs),
             fractured=FracturedMorphoMNIST(**kwargs),
@@ -388,8 +392,8 @@ class PSFTwinNetDataset(Dataset):
             sample_shape=(len(self.psf_dataset), self.outcome_noise_dim),
         )
 
-
     # TODO: consider moving to DataModule
+
     @classmethod
     def sample_outcome_noise(
         cls,
@@ -500,9 +504,10 @@ class PSFTwinNetDataModule(MorphoMNISTDataModule):
             train_batch_size=train_batch_size,
             test_batch_size=test_batch_size,
             pin_memory=pin_memory,
-            transform=transforms.Compose([
-                transforms.Normalize(mean=0.5, std=0.5),
-            ]),
+            transform=DictTransform(
+                key='image',
+                transform_value=transforms.Normalize(mean=0.5, std=0.5),
+            ),
         )
 
 

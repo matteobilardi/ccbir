@@ -1,3 +1,4 @@
+from typing import Callable, Hashable, TypeVar
 from torch import Tensor
 import numpy as np
 import torch
@@ -26,3 +27,25 @@ def from_numpy_image(
         return img.to(dtype=default_float_dtype).div(255)
     else:
         return img
+
+
+class DictTransform:
+    """Defines a transformation on the value under key for an item that
+    is of type dictionary"""
+
+    def __init__(self, key: Hashable, transform_value: Callable):
+        self.key = key
+        self.transform_value = transform_value
+
+    def __call__(self, item):
+        if not isinstance(item, dict):
+            raise TypeError(f"expected dict, got f{type(item)=}")
+
+        try:
+            value = item[self.key]
+        except KeyError as e:
+            raise KeyError(f'Could not find key={self.key} in {item=}') from e
+
+        # create new dictionary with previous key value overwritten by
+        # transformed value
+        return {**item, self.key: self.transform_value(value)}

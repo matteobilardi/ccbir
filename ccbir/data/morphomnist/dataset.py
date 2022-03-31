@@ -63,6 +63,9 @@ class MorphoMNIST(torchvision.datasets.VisionDataset):
             # to introducing regularisation to the dataset itself and would
             # cause an unfair evaluation of performance. Hence, this can't
             # be done by passing a stochastic transform.
+            # Also, its seems that deterministic binarization like thresholding
+            # should also be avoided for fair comparisons.
+            # See https://twitter.com/poolio/status/1001535260008443904?s=20&t=JeEO0hZkserQwfCnR7sYSg
             self.images = torch.bernoulli(self.images)
 
         # copy labels so that torch doesn't complain about non-writable
@@ -72,7 +75,7 @@ class MorphoMNIST(torchvision.datasets.VisionDataset):
         # enforce float32 metrics (instead of float64 of loaded numpy array) in
         # line with default pytorch tensors
         self.metrics = {
-            metric_name: torch.tensor(
+            metric_name: torch.as_tensor(
                 metric_values.values,
                 dtype=torch.float32,
             )
@@ -137,19 +140,16 @@ class MorphoMNIST(torchvision.datasets.VisionDataset):
         return len(self.images)
 
     def __getitem__(self, index):
-        image = self.images[index]
+        item = dict(
+            image=self.images[index],
+            label=self.labels[index],
+            metrics={k: v[index] for k, v in self.metrics.items()},
+        )
 
         if self.transform is not None:
-            if isinstance(index, slice):
-                # some torchvision transforms don't support batching so handle
-                # slices explictly (and slowly)
-                image = default_collate(list(map(self.transform, image)))
-            else:
-                image = self.transform(image)
+            item = self.transform(item)
 
-        metrics = {k: v[index] for k, v in self.metrics.items()}
-
-        return dict(image=image, label=self.labels[index], metrics=metrics)
+        return item
 
     @staticmethod
     def get_images_path(data_path: Path, train: bool):
@@ -274,6 +274,7 @@ class PerturbedMorphoMNIST(MorphoMNIST):
         generator: Optional[PerturbedMorphoMNISTGenerator] = None,
         train: bool,
         overwrite: bool = False,
+        transform: Callable = None,
         **kwargs,
     ):
         self.perturbation_type = perturbation_type
@@ -313,6 +314,8 @@ class PerturbedMorphoMNIST(MorphoMNIST):
             )
 
         super().__init__(data_dir=str(self.data_path), train=train, **kwargs)
+        # FIXME: hacky overwritten transform fix
+        self.transform = transform
 
     @staticmethod
     def get_perturbations_args_path(data_path: Path, train: bool) -> Path:
@@ -324,10 +327,20 @@ class PerturbedMorphoMNIST(MorphoMNIST):
         return str(self.perturbation_type.__name__).lower()
 
     def __getitem__(self, index):
+        # FIXME: very hacky way to fix overwritten transform attribute: probably
+        # should switch to composition over inheritance
+        transform = self.transform
+        self.transform = None
         item = super().__getitem__(index)
-        item['perturbations_args'] = (
-            self.perturbations_args.iloc[index].to_dict()
-        )
+        self.transform = transform
+
+        item = {
+            **item,
+            'perturbations_args': self.perturbations_args.iloc[index].to_dict()
+        }
+
+        if self.transform is not None:
+            item = self.transform(item)
 
         return item
 

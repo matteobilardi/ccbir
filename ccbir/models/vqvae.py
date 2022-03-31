@@ -1,14 +1,16 @@
 from ccbir.configuration import config
 config.pythonpath_fix()
-from typing import Callable, Literal, Optional, Type
-from ccbir.data.morphomnist.dataset import LocalPerturbationsMorphoMNIST, MorphoMNIST
-from ccbir.data.morphomnist.datamodule import MorphoMNISTDataModule
-from ccbir.pytorch_vqvae.modules import VectorQuantizedVAE
-from torchvision import transforms
-import pytorch_lightning as pl
-import torch
-import torch.nn.functional as F
+from ccbir.data.dataset import InterleaveDataset, ZipDataset
+from torch.utils.data import Dataset
 from torch import Tensor
+import torch.nn.functional as F
+import torch
+import pytorch_lightning as pl
+from torchvision import transforms
+from ccbir.pytorch_vqvae.modules import VectorQuantizedVAE
+from ccbir.data.morphomnist.datamodule import MorphoMNISTDataModule
+from ccbir.data.morphomnist.dataset import FracturedMorphoMNIST, LocalPerturbationsMorphoMNIST, MorphoMNIST, SwollenMorphoMNIST
+from typing import Callable, Literal, Optional, Type
 
 
 class VQVAE(pl.LightningModule):
@@ -65,12 +67,7 @@ class VQVAE(pl.LightningModule):
         else:
             raise ValueError(f'Invalid {latent_type=}')
 
-    def _prep_batch(self, batch):
-        x = batch['image']
-        return x
-
-    def _step(self, batch):
-        x = self._prep_batch(batch)
+    def _step(self, x):
         x_tilde, z_e_x, z_q_x = self.model(x)
 
         # reconstruction loss
@@ -109,11 +106,29 @@ class VQVAE(pl.LightningModule):
         return torch.optim.Adam(self.model.parameters(), lr=self.lr)
 
 
+class VQVAEDataset(InterleaveDataset):
+
+    def __init__(
+        self,
+        train: bool,
+        transform=None,
+    ) -> None:
+        kwargs = dict(
+            train=train,
+            transform=transform,
+        )
+
+        super().__init__(datasets=[
+            SwollenMorphoMNIST(**kwargs),
+            FracturedMorphoMNIST(**kwargs),
+        ])
+
+
 class VQVAEMorphoMNISTDataModule(MorphoMNISTDataModule):
     def __init__(
         self,
         *,
-        dataset_type: Type[MorphoMNIST] = LocalPerturbationsMorphoMNIST,
+        dataset_type: Type[MorphoMNIST] = VQVAEDataset,
         train_batch_size: int = 64,
         test_batch_size: int = 64,
         pin_memory: bool = True,
@@ -124,6 +139,7 @@ class VQVAEMorphoMNISTDataModule(MorphoMNISTDataModule):
             test_batch_size=test_batch_size,
             pin_memory=pin_memory,
             transform=transforms.Compose([
+                transforms.Lambda(lambda item: item['image']),
                 # enforce range [-1, 1] in line with tanh NN output
                 # see https://discuss.pytorch.org/t/understanding-transform-normalize/21730/2
                 transforms.Normalize(mean=0.5, std=0.5)

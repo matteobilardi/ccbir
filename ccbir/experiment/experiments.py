@@ -89,8 +89,7 @@ class VQVAEExperiment:
         )
 
     def show_vqvae_recons(self, num_images: int = 32, train: bool = False):
-        data = self.data.dataset(train)[:num_images]
-        images = data['image']
+        images = self.data.dataset(train)[:num_images]
 
         with torch.no_grad():
             recons, _z_e, _z_q = self.vqvae(images)

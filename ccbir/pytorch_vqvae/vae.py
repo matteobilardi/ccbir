@@ -92,7 +92,7 @@ def test():
     print('\nValidation Completed!\tLoss: {:5.4f} Time: {:5.3f} s'.format(
         np.asarray(val_loss).mean(0),
         time.time() - start_time
-    ))
+        ))
     return np.asarray(val_loss).mean(0)
 
 
