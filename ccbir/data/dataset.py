@@ -1,6 +1,7 @@
-from itertools import starmap
-from typing import List, Mapping
-from more_itertools import zip_equal
+import operator
+from itertools import starmap, repeat
+from typing import List, Mapping, Tuple
+from more_itertools import interleave_evenly, repeat_each, zip_equal
 from torch.utils.data import Dataset, default_collate
 import torch
 
@@ -30,42 +31,29 @@ class ZipDataset(Dataset):
 
 
 class InterleaveDataset(Dataset):
-    """Randomly inteleaves all items in all the given datasets. Assumes that
-    items have the same type across datasets. Equivalent to concatenating
-    the dataset items into a list and shuffling"""
+    """Inteleaves all items in all the given datasets. Assumes that
+    items have the same type across datasets."""
 
     def __init__(self, datasets: List[Dataset]):
         super().__init__()
         self.datasets = datasets
-        self._len = sum(map(len, datasets))
 
-        dataset_idx_for_idx = torch.cat([
-            torch.tensor(idx).expand(len(dataset))
-            for idx, dataset in enumerate(datasets)
-        ])
-
-        idx_in_dataset_for_idx = torch.cat([
-            torch.arange(len(dataset)) for dataset in datasets
-        ])
-
-        shuffle_idxs = torch.randperm(self._len)
-        self.dataset_idx_for_idx = dataset_idx_for_idx[shuffle_idxs]
-        self.idx_in_dataset_for_idx = idx_in_dataset_for_idx[shuffle_idxs]
+        self.dataset_with_item_idx_for: Mapping[int, Tuple[Dataset, int]] = (
+            list(interleave_evenly([
+                list(zip(repeat(dataset), range(len(dataset))))
+                for dataset in datasets
+            ]))
+        )
 
     def __len__(self) -> int:
-        return self._len
+        return len(self.dataset_with_item_idx_for)
 
     def __getitem__(self, index):
-        # we convert to numpy because an iterator over numpy arrays yields ints
-        # rather than tensors of single elements, which avoids issues when
-        # indexing dataframes (this is a concern when index is a slice)
-        dataset_idx = self.dataset_idx_for_idx[index].numpy()
-        idx_in_dataset = self.idx_in_dataset_for_idx[index].numpy()
-
+        dataset_with_item_idx = self.dataset_with_item_idx_for[index]
         if isinstance(index, slice):
             return default_collate([
-                self.datasets[d_idx][idx_in_d]
-                for d_idx, idx_in_d in zip_equal(dataset_idx, idx_in_dataset)
+                dataset[idx] for dataset, idx in dataset_with_item_idx
             ])
         else:
-            return self.datasets[dataset_idx][idx_in_dataset]
+            dataset, item_idx = dataset_with_item_idx
+            return dataset[item_idx]

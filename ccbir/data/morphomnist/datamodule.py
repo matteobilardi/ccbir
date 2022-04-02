@@ -18,34 +18,16 @@ class MorphoMNISTDataModule(pl.LightningDataModule):
             Callable[..., MorphoMNIST]
         ]],
         num_workers: int = multiprocessing.cpu_count(),
-        train_batch_size: int,
-        test_batch_size: int,
+        batch_size: int,
         pin_memory: bool,
         transform,
     ):
         super().__init__()
         self.dataset_ctor = dataset_ctor
-        self.train_batch_size = train_batch_size
-        self.test_batch_size = test_batch_size
+        self.batch_size = batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.transform = transform
-
-        """
-        if data_dir is None:
-            init_signature = inspect.signature(dataset_type.__init__)
-            default_data_dir = init_signature.parameters['data_dir'].default
-            if default_data_dir is inspect.Parameter.empty:
-                raise ValueError(
-                    f"data_dir cannot be None when the given {dataset_type=}"
-                    "has no default value for the data_dir parameter in its"
-                    "constuctor"
-                )
-            else:
-                self.data_dir = default_data_dir
-        else:
-            self.data_dir = data_dir
-        """
 
     def prepare_data(self):
         # check that the data lives on disk (else generate it)
@@ -69,7 +51,7 @@ class MorphoMNISTDataModule(pl.LightningDataModule):
     def train_dataloader(self) -> DataLoader:
         return DataLoader(
             self.mnist_train,
-            batch_size=self.train_batch_size,
+            batch_size=self.batch_size,
             shuffle=True,
             pin_memory=self.pin_memory,
             num_workers=self.num_workers
@@ -78,7 +60,7 @@ class MorphoMNISTDataModule(pl.LightningDataModule):
     def val_dataloader(self) -> DataLoader:
         return DataLoader(
             self.mnist_val,
-            batch_size=self.test_batch_size,
+            batch_size=self.batch_size,
             pin_memory=self.pin_memory,
             num_workers=self.num_workers
         )
@@ -86,7 +68,7 @@ class MorphoMNISTDataModule(pl.LightningDataModule):
     def test_dataloader(self) -> DataLoader:
         return DataLoader(
             self.mnist_test,
-            batch_size=self.test_batch_size,
+            batch_size=self.batch_size,
             pin_memory=self.pin_memory,
             num_workers=self.num_workers,
         )

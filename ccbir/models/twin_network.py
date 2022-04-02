@@ -1,3 +1,4 @@
+from multiprocessing.sharedctypes import Value
 from torch.utils.data import Dataset
 import torch.nn.functional as F
 import torch
@@ -32,9 +33,11 @@ class SimpleDeepTwinNetComponent(nn.Module):
         confounders_dim: int,
         outcome_noise_dim: int,
         outcome_shape: torch.Size,
-        noise_inject_mode: Literal['concat', 'add', 'multiply'] = 'multiply',
-        use_combine_net: bool = True,
-        weight_sharing: bool = False,
+        noise_inject_mode: Literal['concat', 'add', 'multiply'],
+        use_combine_net: bool,
+        weight_sharing: bool,
+        activation: Literal['relu', 'leakyrelu', 'silu', 'mish'],
+        batch_norm: bool,
     ):
         super().__init__()
         self.use_combine_net = use_combine_net
@@ -53,151 +56,34 @@ class SimpleDeepTwinNetComponent(nn.Module):
             self.input_dim = self.data_dim
             self.inject_noise = torch.mul
         else:
-            raise TypeError(f"Invalid {noise_inject_mode=}")
+            raise ValueError(f"Invalid {noise_inject_mode=}")
 
-        def Activation():
-            # return nn.ReLU(inplace=True)
-            return nn.SiLU(inplace=True)
-            # return nn.LeakyReLU(inplace=True)
+        def _mk_activation():
+            if activation == 'relu':
+                return nn.ReLU(inplace=True)
+            elif activation == 'silu':
+                return nn.SiLU(inplace=True)
+            elif activation == 'leakyrelu':
+                return nn.LeakyReLU(inplace=True)
+            elif activation == 'mish':
+                return nn.Mish(inplace=True)
+            else:
+                raise ValueError(f"Invalid {activation=}")
 
         # TODO: For clarity consider not using lazy layers once the architecture
         # is stabilised
+        def linear_layer(out_features: int, batch_norm: bool = batch_norm):
+            layers = []
+            layers.append(nn.LazyLinear(out_features=out_features))
+            if batch_norm:
+                layers.append(nn.LazyBatchNorm1d())
 
-        """
-        self.net = nn.Sequential(
-            nn.LazyLinear(base_dim * 8),
-            Activation(),
-            nn.Unflatten(1, (-1, 1, 1)),
-            nn.LazyConvTranspose2d(base_dim * 4, 3, 1),
-            # nn.LazyBatchNorm2d(),
-            Activation(),
-            nn.LazyConvTranspose2d(base_dim * 2, 3, 1),
-            # nn.LazyBatchNorm2d(),
-            Activation(),
-            nn.LazyConvTranspose2d(base_dim, 3, 1),
-        )
-        """
-
-        # conv transpose without batchnorm
-        """
-        self.net = nn.Sequential(
-            nn.Unflatten(1, (-1, 1, 1)),
-            nn.LazyConvTranspose2d(128, 2),
-            Activation(),
-            nn.LazyConvTranspose2d(128, 2),
-            Activation(),
-            nn.LazyConvTranspose2d(64, 2),
-            Activation(),
-            nn.LazyConvTranspose2d(64, 2),
-            Activation(),
-            nn.LazyConvTranspose2d(32, 2),
-            Activation(),
-            nn.LazyConvTranspose2d(16, 2),
-        )
-        """
-
-        """
-        # a very deep convtranspose net without batchnorm (better val loss than previous)
-        self.net = nn.Sequential(
-            nn.Unflatten(1, (-1, 1, 1)),
-            nn.LazyConvTranspose2d(128, 2),
-            Activation(),
-            nn.LazyConvTranspose2d(128, 2),
-            Activation(),
-            nn.LazyConvTranspose2d(64, 2),
-            Activation(),
-            nn.LazyConvTranspose2d(64, 2),
-            Activation(),
-            nn.LazyConvTranspose2d(32, 2),
-            Activation(),
-            nn.LazyConvTranspose2d(16, 2),
-            Activation(),
-            nn.LazyConv2d(16, 3, padding=1),
-            Activation(),
-            nn.LazyConv2d(16, 3, padding=1),
-            Activation(),
-            nn.LazyConv2d(16, 3, padding=1),
-        )
-        """
-
-        """
-        self.net = nn.Sequential(
-            nn.Unflatten(1, (-1, 1, 1)),
-            nn.LazyConvTranspose2d(128, 3),
-            nn.LazyBatchNorm2d(),
-            Activation(),
-            nn.LazyConvTranspose2d(128, 3),
-            nn.LazyBatchNorm2d(),
-            Activation(),
-            nn.LazyConvTranspose2d(128, 3),
-            nn.LazyBatchNorm2d(),
-            Activation(),
-            nn.LazyConvTranspose2d(128, 3),
-            nn.LazyBatchNorm2d(),
-            Activation(),
-            nn.LazyConv2d(64, 3),
-            nn.LazyBatchNorm2d(),
-            Activation(),
-            nn.LazyConv2d(16, 1),
-            nn.LazyBatchNorm2d(),
-            Activation(),
-            nn.LazyConv2d(16, 1),
-        )
-        """
-
-        """
-        # best conv so far
-        self.net = nn.Sequential(
-            nn.Unflatten(1, (-1, 1, 1)),
-            nn.LazyConvTranspose2d(128, 3),
-            Activation(),
-            nn.LazyConvTranspose2d(128, 3),
-            Activation(),
-            nn.LazyConvTranspose2d(128, 3),
-            Activation(),
-            nn.LazyConvTranspose2d(64, 3),
-            Activation(),
-            nn.LazyConv2d(64, 3),
-            Activation(),
-            nn.LazyConv2d(16, 1),
-            Activation(),
-            nn.LazyConv2d(4, 1),
-        )
-        """
-
-        """
-        # a fully linear attempt (version 66 checkpoint)
-        # best of ll so far (MSE loss at 0.09-0.1)
-        self.net = nn.Sequential(
-            nn.LazyLinear(1024),
-            Activation(),
-            nn.LazyLinear(1024),
-            Activation(),
-            nn.LazyLinear(1024),
-            Activation(),
-            nn.LazyLinear(512),
-            Activation(),
-            nn.LazyLinear(196),
-            nn.Unflatten(1, (4, 7, 7))
-        )
-        """
-
-        """
-        # a shallower fully linear attempt
-        self.net = nn.Sequential(
-            nn.LazyLinear(1024),
-            Activation(),
-            nn.LazyLinear(1024),
-            Activation(),
-            nn.LazyLinear(196),
-            nn.Unflatten(1, (4, 7, 7))
-        )
-        """
+            return nn.Sequential(*layers)
 
         self.combine_treatment_confounders_net = nn.Sequential(
-            nn.LazyLinear(self.data_dim),
-            Activation(),
-            nn.LazyLinear(self.data_dim),
+            linear_layer(self.data_dim),
+            _mk_activation(),
+            linear_layer(self.data_dim),
         ) if use_combine_net else None
 
         # to inject noise via multiplication/addition, we currently force
@@ -207,26 +93,25 @@ class SimpleDeepTwinNetComponent(nn.Module):
         # reparametrize_noise_net. For pure convenience, currently this is the
         # case even when we inject noise by concatenation
         self.reparametrize_noise_net = nn.Sequential(
-            nn.LazyLinear(self.data_dim),
-            Activation(),
-            nn.LazyLinear(self.data_dim),
+            linear_layer(self.data_dim),
+            _mk_activation(),
+            linear_layer(self.data_dim),
         )
-
 
         # NOTE: so far best architecture: obtained  MSE ~0.075, without
         # weight sharing, beating previous best (version 75)
         def make_branch():
             return nn.Sequential(
-                nn.LazyLinear(1024),
-                Activation(),
-                nn.LazyLinear(1024),
-                Activation(),
-                nn.LazyLinear(1024),
-                Activation(),
-                nn.LazyLinear(512),
-                Activation(),
-                nn.LazyLinear(196),
-                nn.Unflatten(1, (4, 7, 7))
+                linear_layer(1024),
+                _mk_activation(),
+                linear_layer(1024),
+                _mk_activation(),
+                linear_layer(1024),
+                _mk_activation(),
+                linear_layer(512),
+                _mk_activation(),
+                linear_layer(512),
+                nn.Unflatten(1, outcome_shape)
             )
 
         self.factual_branch = make_branch()
@@ -295,7 +180,7 @@ class SimpleDeepTwinNetComponent(nn.Module):
         return factual_outcome, counterfactual_outcome
 
 
-class SimpleDeepTwinNet(pl.LightningModule):
+class TwinNet(pl.LightningModule):
     def __init__(
         self,
         treatment_dim: int,
@@ -303,6 +188,11 @@ class SimpleDeepTwinNet(pl.LightningModule):
         outcome_noise_dim: int,
         outcome_size: torch.Size,
         lr: float,
+        noise_inject_mode: Literal['concat', 'add', 'multiply'] = 'multiply',
+        use_combine_net: bool = True,
+        weight_sharing: bool = False,
+        activation: Literal['relu', 'leakyrelu', 'silu', 'mish'] = 'relu',
+        batch_norm: bool = False,
     ):
         super().__init__()
         self.twin_net = SimpleDeepTwinNetComponent(
@@ -310,6 +200,11 @@ class SimpleDeepTwinNet(pl.LightningModule):
             confounders_dim=confounders_dim,
             outcome_noise_dim=outcome_noise_dim,
             outcome_shape=outcome_size,
+            noise_inject_mode=noise_inject_mode,
+            use_combine_net=use_combine_net,
+            weight_sharing=weight_sharing,
+            activation=activation,
+            batch_norm=batch_norm,
         )
         self.outcome_noise_dim = outcome_noise_dim
         self.lr = lr
@@ -320,6 +215,10 @@ class SimpleDeepTwinNet(pl.LightningModule):
 
     def _step(self, batch):
         X, y, _ = batch
+
+        # FIXME: this helps pytorch-lighnting with ambiguos batch sizes
+        batch_size = y['factual_outcome'].shape[0]
+        self.log('batch_size_hotfix', batch_size, batch_size=batch_size)
 
         factual_outcome_hat, counterfactual_outcome_hat = self(X)
 
@@ -467,7 +366,7 @@ class PSFTwinNetDataset(Dataset):
         return x, y, psf_item
 
 
-class PSFTwinNet(SimpleDeepTwinNet):
+class PSFTwinNet(TwinNet):
     def __init__(
         self,
         outcome_size: torch.Size,
@@ -491,8 +390,7 @@ class PSFTwinNetDataModule(MorphoMNISTDataModule):
         self,
         *,
         embed_image: Callable[[Tensor], Tensor],
-        train_batch_size: int = 64,
-        test_batch_size: int = 64,
+        batch_size: int = 64,
         pin_memory: bool = True,
     ):
 
@@ -501,8 +399,7 @@ class PSFTwinNetDataModule(MorphoMNISTDataModule):
                 PSFTwinNetDataset,
                 embed_image=embed_image
             ),
-            train_batch_size=train_batch_size,
-            test_batch_size=test_batch_size,
+            batch_size=batch_size,
             pin_memory=pin_memory,
             transform=DictTransform(
                 key='image',
@@ -549,7 +446,7 @@ def main():
             callbacks=[
                 ModelCheckpoint(
                     monitor='val_loss',
-                    filename='twinnet-{epoch:03d}-{val_loss:.7f}',
+                    filename='twinnet-{epoch:03d}-{val_loss:.7f}-{loss:.7f}',
                     save_top_k=3,
                     save_last=True,
                 ),

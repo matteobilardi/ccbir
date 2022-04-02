@@ -1,24 +1,36 @@
 
+from ccbir.configuration import config
+from ccbir.data.morphomnist.perturb import (
+    FractureArgsSampler,
+    PerturbationArgsSampler,
+    SwellingArgsSampler,
+    perturb_image,
+)
+from ccbir.tranforms import from_numpy_image
+from ccbir.util import leaves_getitem, tupled_args
+from deepscm.morphomnist.perturb import Fracture, Perturbation, Swelling
+from deepscm.datasets.morphomnist import (
+    MorphoMNISTLike,
+    load_morphomnist_like,
+    save_morphomnist_like,
+)
+from itertools import repeat
+from more_itertools import unzip
+from pandas.api.types import is_numeric_dtype, is_float_dtype
+from pathlib import Path
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_is_fitted
+from toolz import assoc_in
 from torch import Tensor
-from torch.utils.data import default_collate
-import torch
-from ccbir.tranforms import from_numpy_image
-from ccbir.configuration import config
-from ccbir.data.morphomnist.perturbsampler import FractureSampler, PerturbationSampler, SwellingSampler
-from deepscm.datasets.morphomnist import MorphoMNISTLike, load_morphomnist_like, save_morphomnist_like
-from deepscm.morphomnist.morpho import ImageMorphology
-from deepscm.morphomnist.perturb import Fracture, Perturbation, Swelling
-from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Type, Union
-import PIL
 import multiprocessing
 import numpy as np
 import pandas as pd
+import pickle
+import torch
+from torch.utils.data import default_convert
 import torchvision
 import tqdm
-import pickle
 
 
 class MorphoMNIST(torchvision.datasets.VisionDataset):
@@ -172,74 +184,74 @@ class PerturbedMorphoMNISTGenerator:
     perturbation_type initilised with arguments obtained by sampling from the
     given perturbation_sampler and applied to the original MNIST dataset. """
 
-    _THRESHOLD = .5
-    _UP_FACTOR = 4
-
     def __init__(
         self,
         perturbation_type: Type[Perturbation],
-        perturbation_sampler: PerturbationSampler,
+        perturbation_args_sampler: PerturbationArgsSampler,
         original_data_dir: str = str(config.original_mnist_data_path),
     ):
 
         if not issubclass(
-            perturbation_sampler.perturbation_type,
+            perturbation_args_sampler.perturbation_type,
             perturbation_type
         ):
             raise TypeError(
-                f"{perturbation_sampler.perturbation_type=} is not a subclass "
-                f"of {perturbation_type=}"
+                f"{perturbation_args_sampler.perturbation_type=} is not a "
+                f"subclass of {perturbation_type=}"
             )
 
         self.perturbation_type = perturbation_type
-        self.perturbation_sampler = perturbation_sampler
+        self.perturbation_args_sampler = perturbation_args_sampler
         self.original_data_dir = original_data_dir
-
-    def _perturb_image(
-        self,
-        perturbation_and_image: Tuple[Perturbation, np.ndarray]
-    ) -> np.ndarray:
-        perturbation, image = perturbation_and_image
-        morph = ImageMorphology(image, self._THRESHOLD, self._UP_FACTOR)
-        perturbed_image = morph.downscale(perturbation(morph))
-
-        return perturbed_image
 
     def generate_dataset(
         self,
         out_dir: str,
         *,
         train: bool,
-    ):
+    ) -> Tuple[np.ndarray, pd.DataFrame]:
         original_dataset = MorphoMNISTLike(self.original_data_dir, train=train)
         original_images = original_dataset.images
-        perturbations, perturbations_args = (
-            self.perturbation_sampler.sample(len(original_images))
+        num_images = len(original_images)
+        perturbation_types = repeat(self.perturbation_type, num_images)
+        perturbations_args = (
+            self.perturbation_args_sampler
+            .sample_args(num_images)
+            .to_dict(orient='records')
         )
 
         with multiprocessing.Pool() as pool:
             perturbed_images_gen = pool.imap(
-                self._perturb_image,
-                zip(perturbations, original_images),
-                chunksize=128
+                tupled_args(perturb_image),
+                zip(original_images, perturbation_types, perturbations_args),
+                chunksize=128,
             )
 
             # dispaly progress bar (technically not up to date because generator
             # blocks for correct result order)
             perturbed_images_gen = tqdm.tqdm(
-                perturbed_images_gen,
-                total=len(original_images),
+                iterable=perturbed_images_gen,
+                total=num_images,
                 unit='img',
-                ascii=True
+                ascii=True,
             )
+            perturbed_images, perturbations_data = unzip(perturbed_images_gen)
+            perturbed_images = list(perturbed_images)
+            perturbations_data = list(perturbations_data)
 
-            perturbed_images = np.stack(list(perturbed_images_gen))
+        perturbed_images = np.stack(perturbed_images)
+        perturbations_data = pd.json_normalize(
+            data=perturbations_data,
+            # perturbations may have different number of locations, hence
+            # do not enforce that all locations always appear
+            errors='ignore',
+        )
 
         out_path = Path(out_dir)
         out_path.mkdir(parents=True, exist_ok=True)
 
-        perturbations_args_path = (
-            PerturbedMorphoMNIST.get_perturbations_args_path(out_path, train)
+        perturbations_data_path = (
+            PerturbedMorphoMNIST.get_perturbations_data_path(out_path, train)
         )
 
         # TODO? For now no need to compute metrics for perturbed images
@@ -253,9 +265,9 @@ class PerturbedMorphoMNISTGenerator:
             train=train,
         )
 
-        perturbations_args.to_csv(perturbations_args_path, index_label='index')
+        perturbations_data.to_csv(perturbations_data_path, index_label='index')
 
-        return perturbed_images, perturbations_args
+        return perturbed_images, perturbations_data
 
 
 class PerturbedMorphoMNIST(MorphoMNIST):
@@ -270,9 +282,9 @@ class PerturbedMorphoMNIST(MorphoMNIST):
         self,
         perturbation_type: Type[Perturbation],
         *,
+        train: bool,
         data_dir: Optional[str] = None,
         generator: Optional[PerturbedMorphoMNISTGenerator] = None,
-        train: bool,
         overwrite: bool = False,
         transform: Callable = None,
         **kwargs,
@@ -286,15 +298,15 @@ class PerturbedMorphoMNIST(MorphoMNIST):
             self.data_path = Path(data_dir).resolve(strict=True)
 
         images_path = self.get_images_path(self.data_path, train)
-        perturbations_args_path = (
-            self.get_perturbations_args_path(self.data_path, train)
+        perturbations_data_path = (
+            self.get_perturbations_data_path(self.data_path, train)
         )
 
         # Load dataset or generate it if it does not exist
-        exists = images_path.exists() and perturbations_args_path.exists()
+        exists = images_path.exists() and perturbations_data_path.exists()
         if exists and not overwrite:
-            self.perturbations_args = (
-                pd.read_csv(perturbations_args_path, index_col='index')
+            perturbations_df = (
+                pd.read_csv(perturbations_data_path, index_col='index')
             )
         elif generator is None:
             raise ValueError(
@@ -308,35 +320,77 @@ class PerturbedMorphoMNIST(MorphoMNIST):
                 f"{perturbation_type}"
             )
 
-            _images, self.perturbations_args = generator.generate_dataset(
+            _images, perturbations_df = generator.generate_dataset(
                 out_dir=str(self.data_path),
                 train=train,
             )
+
+        self.perturbations_data, self._perturbations_df = (
+            self._cleanup_perturbation_data(perturbations_df)
+        )
 
         super().__init__(data_dir=str(self.data_path), train=train, **kwargs)
         # FIXME: hacky overwritten transform fix
         self.transform = transform
 
+    @classmethod
+    def _cleanup_perturbation_data(
+        cls,
+        raw_df: pd.DataFrame
+    ) -> Tuple[Dict, pd.DataFrame]:
+        # unflatten and cleanup perturbations data
+        df = raw_df
+        df.columns = df.columns.str.split('.', expand=True)
+        df = df.rename(columns={np.NaN: ""})
+
+        data = dict()
+        for col_keys, col_values in df.items():
+            valid_keys = []
+            for k in col_keys:
+                assert isinstance(k, str), type(k)
+                if k == "":
+                    continue
+                else:
+                    if k.isnumeric():
+                        assert float(k).is_integer()
+                        valid_keys.append(int(k))
+                    else:
+                        valid_keys.append(k)
+            assert len(valid_keys) > 0
+
+            values = col_values.to_numpy()
+            if np.issubdtype(values.dtype, np.floating):
+                default_float_dtype = torch.get_default_dtype()
+                values = torch.as_tensor(values, dtype=default_float_dtype)
+            else:
+                values = default_convert(values)
+
+            data = assoc_in(data, valid_keys, values)
+
+        return data, df
+
     @staticmethod
-    def get_perturbations_args_path(data_path: Path, train: bool) -> Path:
+    def get_perturbations_data_path(data_path: Path, train: bool) -> Path:
         prefix = "train" if train else "t10k"
-        return data_path / f"{prefix}-perturbations-args.csv"
+        return data_path / f"{prefix}-perturbations-data.csv"
 
     @property
     def perturbation_name(self) -> str:
-        return str(self.perturbation_type.__name__).lower()
+        return self.perturbation_type.__name__.lower()
 
     def __getitem__(self, index):
         # FIXME: very hacky way to fix overwritten transform attribute: probably
-        # should switch to composition over inheritance
+        # should prefer composition over inheritance
         transform = self.transform
         self.transform = None
         item = super().__getitem__(index)
         self.transform = transform
 
+        perturbation_data = leaves_getitem(self.perturbations_data, index)
+
         item = {
             **item,
-            'perturbations_args': self.perturbations_args.iloc[index].to_dict()
+            'perturbation_data': perturbation_data,
         }
 
         if self.transform is not None:
@@ -357,7 +411,9 @@ class PlainMorphoMNIST(MorphoMNIST):
 class SwollenMorphoMNIST(PerturbedMorphoMNIST):
     def __init__(
         self,
-        generator=PerturbedMorphoMNISTGenerator(Swelling, SwellingSampler()),
+        generator=PerturbedMorphoMNISTGenerator(
+            Swelling, SwellingArgsSampler()
+        ),
         **kwargs,
     ):
         super().__init__(Swelling, **kwargs, generator=generator)
@@ -367,7 +423,9 @@ class FracturedMorphoMNIST(PerturbedMorphoMNIST):
     def __init__(
         self,
         *,
-        generator=PerturbedMorphoMNISTGenerator(Fracture, FractureSampler()),
+        generator=PerturbedMorphoMNISTGenerator(
+            Fracture, FractureArgsSampler()
+        ),
         **kwargs
     ):
         super().__init__(Fracture, **kwargs, generator=generator)

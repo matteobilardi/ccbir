@@ -88,17 +88,25 @@ class VQVAEExperiment:
             )
         )
 
-    def show_vqvae_recons(self, num_images: int = 32, train: bool = False):
+    def show_vqvae_recons(
+        self,
+        num_images: int = 32,
+        train: bool = False,
+        dpi: int = 200,
+    ):
         images = self.data.dataset(train)[:num_images]
 
         with torch.no_grad():
             recons, _z_e, _z_q = self.vqvae(images)
 
+        # TODO remove
+        print(f"{_z_q.shape=}")
+
         show_tensor(make_grid(
             tensor=torch.cat((images, recons)),
             normalize=True,
             value_range=(-1, 1),
-        ))
+        ), dpi=dpi)
 
     def _vqvae_z_q(self, x: Tensor) -> Tensor:
         with torch.no_grad():
@@ -212,6 +220,9 @@ class PSFTwinNetExperiment:
         fractured_embedding = (
             y['counterfactual_outcome'].unsqueeze(0)
         )
+
+        print(f"{swollen_embedding.shape=}")
+        print(f"{fractured_embedding.shape=}")
 
         ground_truths = torch.cat((
             original_image,

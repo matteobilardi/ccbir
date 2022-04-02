@@ -1,39 +1,88 @@
 from ccbir.configuration import config
 config.pythonpath_fix()
-from ccbir.data.dataset import InterleaveDataset, ZipDataset
-from torch.utils.data import Dataset
-from torch import Tensor
-import torch.nn.functional as F
-import torch
-import pytorch_lightning as pl
-from torchvision import transforms
-from ccbir.pytorch_vqvae.modules import VectorQuantizedVAE
+from ccbir.data.dataset import InterleaveDataset
 from ccbir.data.morphomnist.datamodule import MorphoMNISTDataModule
 from ccbir.data.morphomnist.dataset import FracturedMorphoMNIST, LocalPerturbationsMorphoMNIST, MorphoMNIST, SwollenMorphoMNIST
+from ccbir.pytorch_vqvae.modules import ResBlock, VectorQuantizedVAE, weights_init
+from torch import Tensor
+from torch.utils.data import Dataset
+from torchvision import transforms
 from typing import Callable, Literal, Optional, Type
+import pytorch_lightning as pl
+import torch
+from torch import nn
+import torch.nn.functional as F
+
+
+class VQVAEComponent(VectorQuantizedVAE):
+    """Wrapper of VQ-VAE in https://github.com/ritheshkumar95/pytorch-vqvae
+    to allow for easy modification of high-level architecture"""
+
+    def __init__(self, in_channels, latent_dim, codebook_size):
+        super().__init__(in_channels, latent_dim, codebook_size)
+        # overwrite encoder/decoder from parent class
+        self.encoder = self._mk_encoder(in_channels, latent_dim)
+        self.decoder = self._mk_decoder(in_channels, latent_dim)
+
+        self.apply(weights_init)
+
+    @classmethod
+    def _mk_activation(cls):
+        return nn.ReLU(inplace=True)
+
+    @classmethod
+    def _mk_encoder(cls, in_channels, latent_dim):
+        return nn.Sequential(
+            nn.Conv2d(in_channels, 4 * latent_dim, 4, 2),
+            nn.BatchNorm2d(4 * latent_dim),
+            cls._mk_activation(),
+            nn.Conv2d(4 * latent_dim, 2 * latent_dim, 3, 1),
+            nn.BatchNorm2d(2 * latent_dim),
+            cls._mk_activation(),
+            nn.Conv2d(2 * latent_dim, latent_dim, 4, 1),
+            ResBlock(latent_dim, activation=cls._mk_activation),
+            ResBlock(latent_dim, activation=cls._mk_activation),
+        )
+
+    @classmethod
+    def _mk_decoder(cls, in_channels, latent_dim):
+        return nn.Sequential(
+            ResBlock(latent_dim, activation=cls._mk_activation),
+            ResBlock(latent_dim, activation=cls._mk_activation),
+            cls._mk_activation(),
+            nn.ConvTranspose2d(latent_dim, 2 * latent_dim, 4, 1),
+            nn.BatchNorm2d(2 * latent_dim),
+            cls._mk_activation(),
+            nn.ConvTranspose2d(2 * latent_dim, 4 * latent_dim, 3, 1),
+            nn.BatchNorm2d(4 * latent_dim),
+            cls._mk_activation(),
+            nn.ConvTranspose2d(4 * latent_dim, in_channels, 4, 2),
+            nn.Tanh()
+        )
 
 
 class VQVAE(pl.LightningModule):
-    """Wrapper of VQ-VAE in https://github.com/ritheshkumar95/pytorch-vqvae
-    Hyperparameters as in https://github.com/praeclarumjj3/VQ-VAE-on-MNIST
-    """
 
     def __init__(
         self,
         in_channels: int = 1,
-        codebook_size: int = 512,         # K
-        latent_dim: int = 4,  # 16         # dimension of z
-        commit_loss_weight: float = 1.0,  # beta
+        codebook_size: int = 1024,         # K
+        latent_dim: int = 8,  # 16         # dimension of z
+        commit_loss_weight: float = 0.25,  # 1.0,  # beta
         lr: float = 2e-4,
     ):
         super().__init__()
-        self.model = VectorQuantizedVAE(
-            input_dim=in_channels,
-            dim=latent_dim,
-            K=codebook_size,
-        )
+        self.in_channels = in_channels
+        self.latent_dim = latent_dim
+        self.codebook_size = codebook_size
         self.commit_loss_weight = commit_loss_weight
         self.lr = lr
+        self.save_hyperparameters()
+        self.model = VQVAEComponent(
+            in_channels=in_channels,
+            latent_dim=latent_dim,
+            codebook_size=codebook_size,
+        )
 
     def forward(self, x):
         return self.model.forward(x)
@@ -129,14 +178,12 @@ class VQVAEMorphoMNISTDataModule(MorphoMNISTDataModule):
         self,
         *,
         dataset_type: Type[MorphoMNIST] = VQVAEDataset,
-        train_batch_size: int = 64,
-        test_batch_size: int = 64,
+        batch_size: int = 64,
         pin_memory: bool = True,
     ):
         super().__init__(
             dataset_ctor=dataset_type,
-            train_batch_size=train_batch_size,
-            test_batch_size=test_batch_size,
+            batch_size=batch_size,
             pin_memory=pin_memory,
             transform=transforms.Compose([
                 transforms.Lambda(lambda item: item['image']),
