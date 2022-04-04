@@ -1,4 +1,4 @@
-from typing import Callable, Hashable, TypeVar
+from typing import Callable, Hashable
 from torch import Tensor
 import numpy as np
 import torch
@@ -41,10 +41,7 @@ class DictTransform:
         if not isinstance(item, dict):
             raise TypeError(f"expected dict, got f{type(item)=}")
 
-        try:
-            value = item[self.key]
-        except KeyError as e:
-            raise KeyError(f'Could not find key={self.key} in {item=}') from e
+        value = item[self.key]
 
         # create new dictionary with previous key value overwritten by
         # transformed value

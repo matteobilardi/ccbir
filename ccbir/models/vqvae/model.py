@@ -1,19 +1,15 @@
-from ccbir.configuration import config
-config.pythonpath_fix()
+from ccbir.pytorch_vqvae.modules import (
+    ResBlock,
+    VectorQuantizedVAE,
+    weights_init,
+)
+from ccbir.util import ActivationFunc, activation_layer_ctor, maybe_unbatched_apply
 from functools import partial
-import torch.nn.functional as F
-from torch import nn
-import torch
 import pytorch_lightning as pl
-from typing import Callable, Literal, Optional, Type
-from torchvision import transforms
-from torch.utils.data import Dataset
-from torch import Tensor
-from ccbir.pytorch_vqvae.modules import ResBlock, VectorQuantizedVAE, weights_init
-from ccbir.data.morphomnist.dataset import FracturedMorphoMNIST, LocalPerturbationsMorphoMNIST, MorphoMNIST, SwollenMorphoMNIST
-from ccbir.data.morphomnist.datamodule import MorphoMNISTDataModule
-from ccbir.data.dataset import InterleaveDataset
-from ccbir.util import ActivationFunc, activation_layer_ctor
+from torch import Tensor, nn
+from typing import Callable, Literal
+import torch
+import torch.nn.functional as F
 
 
 class VQVAEComponent(VectorQuantizedVAE):
@@ -78,6 +74,8 @@ class VQVAEComponent(VectorQuantizedVAE):
 
 class VQVAE(pl.LightningModule):
 
+    LatentType = Literal['encoder_output', 'discrete', 'decoder_input']
+
     def __init__(
         self,
         in_channels: int = 1,
@@ -129,7 +127,7 @@ class VQVAE(pl.LightningModule):
     def embed(
         self,
         x: Tensor,
-        latent_type: Literal['encoder_output', 'discrete', 'decoder_input'],
+        latent_type: LatentType,
     ) -> Tensor:
         if latent_type == 'encoder_output':
             z_e_x = self.model.encoder(x)
@@ -180,75 +178,3 @@ class VQVAE(pl.LightningModule):
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.model.parameters(), lr=self.lr)
-
-
-class VQVAEDataset(InterleaveDataset):
-
-    def __init__(
-        self,
-        train: bool,
-        transform=None,
-    ) -> None:
-        kwargs = dict(
-            train=train,
-            transform=transform,
-        )
-
-        super().__init__(datasets=[
-            SwollenMorphoMNIST(**kwargs),
-            FracturedMorphoMNIST(**kwargs),
-        ])
-
-
-class VQVAEMorphoMNISTDataModule(MorphoMNISTDataModule):
-    def __init__(
-        self,
-        *,
-        dataset_type: Type[MorphoMNIST] = VQVAEDataset,
-        batch_size: int = 64,
-        pin_memory: bool = True,
-    ):
-        super().__init__(
-            dataset_ctor=dataset_type,
-            batch_size=batch_size,
-            pin_memory=pin_memory,
-            transform=transforms.Compose([
-                transforms.Lambda(lambda item: item['image']),
-                # enforce range [-1, 1] in line with tanh NN output
-                # see https://discuss.pytorch.org/t/understanding-transform-normalize/21730/2
-                transforms.Normalize(mean=0.5, std=0.5)
-            ]),
-        )
-
-
-def main():
-    from pytorch_lightning.utilities.cli import LightningCLI
-    from pytorch_lightning.callbacks import ModelCheckpoint
-
-    cli = LightningCLI(
-        VQVAE,
-        VQVAEMorphoMNISTDataModule,
-        save_config_overwrite=True,
-        run=False,  # deactivate automatic fitting
-        trainer_defaults=dict(
-            callbacks=[
-                ModelCheckpoint(
-                    monitor='val_loss',
-                    # dirpath=str(config.checkpoints_path_for_model(
-                    #    model_type=VQVAE
-                    # )),
-                    filename='vqvae-morphomnist-{epoch:03d}-{val_loss:.7f}',
-                    save_top_k=3,
-                    save_last=True,
-                )
-            ],
-            max_epochs=3000,
-            gpus=1,
-        ),
-    )
-    cli.trainer.fit(cli.model, datamodule=cli.datamodule)
-    cli.trainer.test(cli.model, ckpt_path="best", datamodule=cli.datamodule)
-
-
-if __name__ == '__main__':
-    main()

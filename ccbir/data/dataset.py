@@ -1,9 +1,7 @@
-import operator
 from itertools import starmap, repeat
 from typing import List, Mapping, Tuple
-from more_itertools import all_equal, first, interleave_evenly, repeat_each, zip_equal
+from more_itertools import all_equal, first, interleave_evenly
 from torch.utils.data import Dataset, default_collate
-import torch
 from toolz import valmap
 import toolz.curried as C
 

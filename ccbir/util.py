@@ -15,15 +15,16 @@ def maybe_unbatched_apply(
     func: Callable[[Tensor], Tensor],
     x: Tensor,
     single_item_dim: int = 3,
+    **kwargs,
 ):
     """Extends the given func that only works on batched input of shape
     B X C X H X W to also work on single tensors of shape C x H x W
     """
     batched_item_dim = 1 + single_item_dim
     if x.dim() == single_item_dim:
-        return func(x.unsqueeze(0)).squeeze(0)
+        return func(x.unsqueeze(0), **kwargs).squeeze(0)
     elif x.dim() == batched_item_dim:
-        return func(x)
+        return func(x, **kwargs)
     else:
         raise ValueError(
             f"{x.dim()=} but only {single_item_dim} and {batched_item_dim} "

@@ -1,25 +1,21 @@
+from ccbir.models.twinnet.data import PSFTwinNetDataModule, PSFTwinNetDataset
+from ccbir.models.twinnet.model import PSFTwinNet
+from ccbir.models.twinnet.train import vqvae_embed_image
+from ccbir.models.vqvae.data import VQVAEMorphoMNISTDataModule
+from ccbir.models.vqvae.model import VQVAE
 from functools import cached_property, partial
-from typing import Any, Callable, List, Literal, Optional, Type, Union
+from more_itertools import interleave
 from sklearn.manifold import TSNE
 from torch import Tensor
-from ccbir.models.vqvae import VQVAE, VQVAEMorphoMNISTDataModule
-from ccbir.models.twin_network import (
-    PSFTwinNet,
-    PSFTwinNetDataModule,
-    PSFTwinNetDataset,
-    vqvae_embed_image,
-)
-import torch
-from torch.utils.data import default_collate
-from torchvision.utils import make_grid
-from torchvision import transforms
-import matplotlib.pyplot as plt
-import pytorch_lightning as pl
-from deepscm.submodules.morphomnist.morphomnist.perturb import Perturbation
-from more_itertools import interleave
-import pandas as pd
-import seaborn as sns
 from torch.utils.data import Dataset
+from torchvision import transforms
+from torchvision.utils import make_grid
+from typing import Callable, List, Literal, Type, Union
+import matplotlib.pyplot as plt
+import pandas as pd
+import pytorch_lightning as pl
+import seaborn as sns
+import torch
 
 # TODO: rename file
 
