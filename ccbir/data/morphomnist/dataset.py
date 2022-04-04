@@ -7,7 +7,7 @@ from ccbir.data.morphomnist.perturb import (
     perturb_image,
 )
 from ccbir.tranforms import from_numpy_image
-from ccbir.util import leaves_getitem, tupled_args
+from ccbir.util import leavesmap, star_apply
 from deepscm.morphomnist.perturb import Fracture, Perturbation, Swelling
 from deepscm.datasets.morphomnist import (
     MorphoMNISTLike,
@@ -16,11 +16,11 @@ from deepscm.datasets.morphomnist import (
 )
 from itertools import repeat
 from more_itertools import unzip
-from pandas.api.types import is_numeric_dtype, is_float_dtype
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_is_fitted
-from toolz import assoc_in
+from toolz import assoc_in, assoc, valmap
+import toolz.curried as C
 from torch import Tensor
 from typing import Callable, Dict, List, Optional, Tuple, Type, Union
 import multiprocessing
@@ -155,7 +155,7 @@ class MorphoMNIST(torchvision.datasets.VisionDataset):
         item = dict(
             image=self.images[index],
             label=self.labels[index],
-            metrics={k: v[index] for k, v in self.metrics.items()},
+            metrics=valmap(C.get(index), self.metrics),
         )
 
         if self.transform is not None:
@@ -222,7 +222,7 @@ class PerturbedMorphoMNISTGenerator:
 
         with multiprocessing.Pool() as pool:
             perturbed_images_gen = pool.imap(
-                tupled_args(perturb_image),
+                star_apply(perturb_image),
                 zip(original_images, perturbation_types, perturbations_args),
                 chunksize=128,
             )
@@ -386,12 +386,9 @@ class PerturbedMorphoMNIST(MorphoMNIST):
         item = super().__getitem__(index)
         self.transform = transform
 
-        perturbation_data = leaves_getitem(self.perturbations_data, index)
+        perturbation_data = leavesmap(C.get(index), self.perturbations_data)
 
-        item = {
-            **item,
-            'perturbation_data': perturbation_data,
-        }
+        item = assoc(item, 'perturbation_data', perturbation_data)
 
         if self.transform is not None:
             item = self.transform(item)

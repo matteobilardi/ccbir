@@ -1,33 +1,25 @@
 import operator
 from itertools import starmap, repeat
 from typing import List, Mapping, Tuple
-from more_itertools import interleave_evenly, repeat_each, zip_equal
+from more_itertools import all_equal, first, interleave_evenly, repeat_each, zip_equal
 from torch.utils.data import Dataset, default_collate
 import torch
+from toolz import valmap
+import toolz.curried as C
 
 
 class ZipDataset(Dataset):
     def __init__(self, datasets: Mapping[str, Dataset]):
-        super().__init__()
-
         assert len(datasets) > 0
-
-        # check that all datasets have equal length
-        datasets_iter = iter(datasets.values())
-        len_first = len(next(datasets_iter))
-        assert all(len(dataset) == len_first for dataset in datasets_iter)
-
-        self._len = len_first
-        self.datasets = datasets
+        assert all_equal(map(len, datasets.values()))
+        super().__init__()
+        self.name_to_dataset = datasets
 
     def __len__(self) -> int:
-        return self._len
+        return len(first(self.name_to_dataset.values()))
 
     def __getitem__(self, index):
-        return {
-            dataset_name: dataset[index]
-            for dataset_name, dataset in self.datasets.items()
-        }
+        return valmap(C.get(index), self.name_to_dataset)
 
 
 class InterleaveDataset(Dataset):

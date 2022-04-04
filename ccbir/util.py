@@ -1,51 +1,120 @@
-from functools import partial
-from itertools import starmap
-from operator import getitem
-from typing import Callable, Dict, Hashable
+from pathlib import Path
+from typing import Callable, Dict, Hashable, Iterable, Literal, Optional, TypeVar
+from sympy import O
 from torch import Tensor
-from toolz import curry, valmap, get
-
-
-class support_unbatched:
-    """Extends the given func that only works on batched input of shape
-    B X C X W X H to also work on single tensors of shape C x W x H
-    """
-
-    def __init__(self, func: Callable[[Tensor], Tensor]):
-        self.func = func
-
-    def __call__(self, x: Tensor) -> Tensor:
-        if x.dim() == 3:
-            return self.func(x.unsqueeze(0)).squeeze(0)
-        elif x.dim() == 4:
-            return self.func(x)
-        else:
-            raise ValueError(f"{x.dim()=} but only dim 3 and 4 supported")
-
-
-class tupled_args:
-    """Function that returns func(*x) when called on x"""
-
-    def __init__(self, func: Callable):
-        self.func = func
-
-    def __call__(self, arg):
-        return self.func(*arg)
+from toolz import curry, valmap
+import toolz.curried as C
+import pytorch_lightning as pl
+import matplotlib.pyplot as plt
+from ccbir.configuration import config
+from torch import nn
 
 
 @curry
-def _leaves_map(func, obj):
+def maybe_unbatched_apply(
+    func: Callable[[Tensor], Tensor],
+    x: Tensor,
+    single_item_dim: int = 3,
+):
+    """Extends the given func that only works on batched input of shape
+    B X C X H X W to also work on single tensors of shape C x H x W
+    """
+    batched_item_dim = 1 + single_item_dim
+    if x.dim() == single_item_dim:
+        return func(x.unsqueeze(0)).squeeze(0)
+    elif x.dim() == batched_item_dim:
+        return func(x)
+    else:
+        raise ValueError(
+            f"{x.dim()=} but only {single_item_dim} and {batched_item_dim} "
+            "are supported"
+        )
+
+
+T = TypeVar('T')
+
+
+@curry
+def star_apply(func: Callable[..., T], arg: Iterable) -> T:
+    return func(*arg)
+
+
+@curry
+def _leavesmap(func, obj):
     if isinstance(obj, dict):
-        return valmap(_leaves_map(func), obj)
+        return valmap(_leavesmap(func), obj)
     else:
         return func(obj)
 
 
-def leaves_map(func: Callable, d):
+def leavesmap(func: Callable, d: Dict):
+    """Given a possbly-nested dictionary d, returns a new dictionary obtained by
+    applying func to all the non-dictionary objects that appear in the values of
+    any dictionary reachable form d, including d.
+
+    d must not contain cycles.
+    """
     if not isinstance(d, dict):
         raise TypeError(f"d must be a dictionary but was {type(d)}")
-    return _leaves_map(func, d)
+    return _leavesmap(func, d)
 
 
-def leaves_getitem(d: Dict, index) -> Dict:
-    return leaves_map(partial(get, index), d)
+def tune_lr(
+    lr_finder,
+    model: pl.LightningModule,
+    save_plot: bool = True,
+    plot_dir: Optional[str] = None,
+):
+    print(lr_finder.results)
+
+    if save_plot:
+        if plot_dir is None:
+            out_dir = config.checkpoints_path_for_model(type(model))
+            out_path = Path(out_dir)
+            out_path.mkdir(parents=True, exist_ok=True)
+        else:
+            out_path = Path(plot_dir).resolve(strict=True)
+
+        out_path = out_path / 'lr_finder_plot.png'
+        fig = lr_finder.plot(suggest=True)
+        fig.savefig(str(out_path))
+
+    new_lr = lr_finder.suggestion()
+
+    print(f"Updating lr to suggested {new_lr}")
+    # TODO: it may not be necessary to set both of the following
+    # attributes
+    model.lr = new_lr
+    model.hparams.lr = new_lr
+
+
+ActivationFunc = Literal[
+    'relu',
+    'leaky_relu',
+    'swish',
+    'mish',
+    'tanh',
+    'sigmoid',
+]
+
+_activation_layer_ctor = {
+    'relu': nn.ReLU,
+    'leaky_relu': nn.LeakyReLU,
+    'swish': nn.SiLU,
+    'silu': nn.SiLU,
+    'mish': nn.Mish,
+    'tanh': nn.Tanh,
+    'sigmoid': nn.Sigmoid,
+}
+
+
+def activation_layer_ctor(func_name: ActivationFunc) -> nn.Module:
+    try:
+        layer = _activation_layer_ctor[func_name]
+    except KeyError:
+        raise TypeError(
+            f"{func_name} is not a supported activation layer. Must be one of"
+            f"{', '.join(_activation_layer_ctor.keys())}"
+        )
+
+    return layer

@@ -92,13 +92,13 @@ class VQEmbedding(nn.Module):
 
 
 class ResBlock(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, activation=lambda: nn.ReLU(True)):
         super().__init__()
         self.block = nn.Sequential(
-            nn.ReLU(True),
+            activation(),
             nn.Conv2d(dim, dim, 3, 1, 1),
             nn.BatchNorm2d(dim),
-            nn.ReLU(True),
+            activation(),
             nn.Conv2d(dim, dim, 1),
             nn.BatchNorm2d(dim)
         )
