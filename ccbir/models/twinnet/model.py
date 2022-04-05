@@ -58,6 +58,8 @@ class SimpleDeepTwinNetComponent(nn.Module):
             linear_layer(self.data_dim),
             activation(),
             linear_layer(self.data_dim),
+            #activation(),
+            #linear_layer(),
         ) if use_combine_net else None
 
         # to inject noise via multiplication/addition, we currently force
@@ -70,6 +72,8 @@ class SimpleDeepTwinNetComponent(nn.Module):
             linear_layer(self.data_dim),
             activation(),
             linear_layer(self.data_dim),
+            #activation(),
+            #linear_layer(self.data_dim),
         )
 
         # NOTE: so far best architecture: obtained  MSE ~0.075, without
@@ -88,7 +92,8 @@ class SimpleDeepTwinNetComponent(nn.Module):
                 nn.Unflatten(1, outcome_shape)
             )
 
-        def make_branch():
+        def make_branch_():
+            # around 0.25 loss
             return nn.Sequential(
                 nn.Unflatten(1, (-1, 1, 1)),
                 nn.LazyConvTranspose2d(128, 3),
@@ -104,6 +109,29 @@ class SimpleDeepTwinNetComponent(nn.Module):
                 ResBlock(128, activation),
                 ResBlock(128, activation),
                 ResBlock(128, activation),
+                nn.LazyConv2d(2, 2),
+            )
+
+        # best so far ~ 0.035 loss on training set
+        def make_branch():
+            return nn.Sequential(
+                nn.Unflatten(1, (-1, 1, 1)),
+                nn.LazyConvTranspose2d(1024, 3),
+                nn.LazyBatchNorm2d(),
+                activation(),
+                nn.LazyConvTranspose2d(512, 3),
+                nn.LazyBatchNorm2d(),
+                activation(),
+                nn.LazyConvTranspose2d(256, 3),
+                nn.LazyBatchNorm2d(),
+                activation(),
+                nn.LazyConvTranspose2d(128, 3),
+                nn.LazyBatchNorm2d(),
+                activation(),
+                ResBlock(128, activation),
+                ResBlock(128, activation),
+                nn.LazyConv2d(64, 1),
+                ResBlock(64, activation),
                 nn.LazyConv2d(2, 2),
             )
 
@@ -183,7 +211,7 @@ class TwinNet(pl.LightningModule):
         lr: float,
         noise_inject_mode: Literal['concat', 'add', 'multiply'] = 'multiply',
         use_combine_net: bool = True,
-        weight_sharing: bool = False,
+        weight_sharing: bool = True,
         activation: ActivationFunc = 'mish',
         batch_norm: bool = False,
     ):
@@ -223,8 +251,9 @@ class TwinNet(pl.LightningModule):
         loss = factual_loss + counterfactual_loss
 
         # FIXME: this helps pytorch-lighnting with ambiguos batch sizes
+        # but is otherwise unnecessary
         batch_size = y['factual_outcome'].shape[0]
-        self.log('batch_size_fix', batch_size, batch_size=batch_size)
+        self.log('batch_size_fix', -1.0, batch_size=batch_size)
 
         return loss, dict(
             loss=loss,

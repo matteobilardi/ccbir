@@ -206,6 +206,7 @@ class PSFTwinNetExperiment:
         num_samples=32,
         noise_scale: float = 0.25,
         train=False,
+        dpi=300,
     ):
         X, y, psf_item = self.data.dataset(train)[item_idx]
 
@@ -228,12 +229,6 @@ class PSFTwinNetExperiment:
             self.vqvae_recon(fractured_embedding),
         ))
 
-        print('original, swollen, swollen_vqvae, fractured, fractured_vqvae')
-        show_tensor(make_grid(
-            tensor=ground_truths,
-            normalize=True,
-            value_range=(-1, 1)
-        ))
 
         # repeat input num_samples time
         X = {
@@ -262,6 +257,13 @@ class PSFTwinNetExperiment:
 
         # paired up images sampled via the twinnet
         images_hat = self.vqvae_recon(paired_up_embeddings)
+        
+        print('original, swollen, swollen_vqvae, fractured, fractured_vqvae')
+        show_tensor(make_grid(
+            tensor=ground_truths,
+            normalize=True,
+            value_range=(-1, 1)
+        ))
         print('Twin network outputted swollen-fractured pairs')
         show_tensor(
             make_grid(
@@ -269,7 +271,7 @@ class PSFTwinNetExperiment:
                 normalize=True,
                 value_range=(-1, 1),
             ),
-            dpi=250,
+            dpi=dpi,
         )
 
     def plot_twinnet_tsne(self):

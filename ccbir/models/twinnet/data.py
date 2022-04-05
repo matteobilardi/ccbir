@@ -1,3 +1,4 @@
+import numpy as np
 from ccbir.tranforms import DictTransform
 from ccbir.data.dataset import ZipDataset
 from ccbir.data.morphomnist.datamodule import MorphoMNISTDataModule
@@ -66,7 +67,11 @@ class PSFTwinNetDataset(Dataset):
         scale: float = 0.25,
     ) -> Tensor:
         # TODO: consider moving to DataModule
-        return (Normal(0, scale).sample(sample_shape) % 1) + 1
+        # NOTE: this should be exact comparison despite float
+        if scale == 0:
+            return torch.ones(sample_shape)
+        else:
+            return (Normal(0, scale).sample(sample_shape) % 1) + 1
 
     @classmethod
     def pert_type_to_index(cls, pert_type: str) -> int:
@@ -157,7 +162,7 @@ class PSFTwinNetDataset(Dataset):
             for _ in range(coords_to_pad):
                 sorted_locations_coords.append(dummy_location)
 
-        locations_coors_vect = cls._to_vector(sorted_locations_coords)
+        locations_coords_vect = cls._to_vector(sorted_locations_coords)
 
         return torch.cat(
             tensors=(
@@ -166,7 +171,7 @@ class PSFTwinNetDataset(Dataset):
                 # perturbation type so no point in including them in the
                 # treatment vector
                 # *sorted_args,
-                locations_coors_vect,
+                locations_coords_vect,
             ),
             dim=-1,
         )

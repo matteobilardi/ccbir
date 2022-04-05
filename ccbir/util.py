@@ -1,6 +1,6 @@
+from functools import partial
 from pathlib import Path
-from typing import Callable, Dict, Hashable, Iterable, Literal, Optional, TypeVar
-from sympy import O
+from typing import Callable, Dict, Iterable, Literal, Optional, TypeVar
 from torch import Tensor
 from toolz import curry, valmap
 import toolz.curried as C
@@ -14,20 +14,20 @@ from torch import nn
 def maybe_unbatched_apply(
     func: Callable[[Tensor], Tensor],
     x: Tensor,
-    single_item_dim: int = 3,
+    single_item_dims: int = 3,
     **kwargs,
 ):
     """Extends the given func that only works on batched input of shape
     B X C X H X W to also work on single tensors of shape C x H x W
     """
-    batched_item_dim = 1 + single_item_dim
-    if x.dim() == single_item_dim:
+    batched_item_dim = 1 + single_item_dims
+    if x.dim() == single_item_dims:
         return func(x.unsqueeze(0), **kwargs).squeeze(0)
     elif x.dim() == batched_item_dim:
         return func(x, **kwargs)
     else:
         raise ValueError(
-            f"{x.dim()=} but only {single_item_dim} and {batched_item_dim} "
+            f"{x.dim()=} but only {single_item_dims} and {batched_item_dim} "
             "are supported"
         )
 
@@ -41,14 +41,14 @@ def star_apply(func: Callable[..., T], arg: Iterable) -> T:
 
 
 @curry
-def _leavesmap(func, obj):
+def _leaves_map(func, obj):
     if isinstance(obj, dict):
-        return valmap(_leavesmap(func), obj)
+        return valmap(_leaves_map(func), obj)
     else:
         return func(obj)
 
 
-def leavesmap(func: Callable, d: Dict):
+def leaves_map(func: Callable, d: Dict):
     """Given a possbly-nested dictionary d, returns a new dictionary obtained by
     applying func to all the non-dictionary objects that appear in the values of
     any dictionary reachable form d, including d.
@@ -57,7 +57,7 @@ def leavesmap(func: Callable, d: Dict):
     """
     if not isinstance(d, dict):
         raise TypeError(f"d must be a dictionary but was {type(d)}")
-    return _leavesmap(func, d)
+    return _leaves_map(func, d)
 
 
 def tune_lr(
@@ -91,7 +91,7 @@ def tune_lr(
 
 ActivationFunc = Literal[
     'relu',
-    'leaky_relu',
+    'leakyrelu',
     'swish',
     'mish',
     'tanh',
@@ -100,7 +100,7 @@ ActivationFunc = Literal[
 
 _activation_layer_ctor = {
     'relu': nn.ReLU,
-    'leaky_relu': nn.LeakyReLU,
+    'leakyrelu': nn.LeakyReLU,
     'swish': nn.SiLU,
     'silu': nn.SiLU,
     'mish': nn.Mish,
@@ -109,13 +109,18 @@ _activation_layer_ctor = {
 }
 
 
-def activation_layer_ctor(func_name: ActivationFunc) -> nn.Module:
+def activation_layer_ctor(
+    func_name: ActivationFunc,
+    inplace: bool = True,
+) -> nn.Module:
     try:
-        layer = _activation_layer_ctor[func_name]
+        layer_ctor = _activation_layer_ctor[func_name]
     except KeyError:
         raise TypeError(
             f"{func_name} is not a supported activation layer. Must be one of"
             f"{', '.join(_activation_layer_ctor.keys())}"
         )
 
-    return layer
+    layer_ctor = partial(layer_ctor, inplace=inplace)
+
+    return layer_ctor
