@@ -1,6 +1,6 @@
 from functools import partial
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Literal, Optional, TypeVar
+from typing import Callable, Dict, Hashable, Iterable, Literal, Optional, Sequence, TypeVar
 from torch import Tensor
 from toolz import curry, valmap
 import toolz.curried as C
@@ -8,6 +8,7 @@ import pytorch_lightning as pl
 import matplotlib.pyplot as plt
 from ccbir.configuration import config
 from torch import nn
+import toolz
 
 
 @curry
@@ -48,16 +49,31 @@ def _leaves_map(func, obj):
         return func(obj)
 
 
-def leaves_map(func: Callable, d: Dict):
+@curry
+def leaves_map(func: Callable, d: Dict, strict=True):
     """Given a possbly-nested dictionary d, returns a new dictionary obtained by
     applying func to all the non-dictionary objects that appear in the values of
     any dictionary reachable form d, including d.
 
     d must not contain cycles.
     """
-    if not isinstance(d, dict):
+    if strict and not isinstance(d, dict):
         raise TypeError(f"d must be a dictionary but was {type(d)}")
     return _leaves_map(func, d)
+
+
+@curry
+def strict_update_in(
+    d: Dict,
+    keys: Sequence[Hashable],
+    func: Callable,
+) -> Dict:
+    assert not isinstance(keys, str)
+
+    # raises key error if not found
+    _ = toolz.get_in(keys, d, no_default=True)
+
+    return toolz.update_in(d, keys, func)
 
 
 def tune_lr(
@@ -124,3 +140,7 @@ def activation_layer_ctor(
     layer_ctor = partial(layer_ctor, inplace=inplace)
 
     return layer_ctor
+
+
+def load_items(dir, generate_items):
+    pass

@@ -1,4 +1,4 @@
-
+from ccbir.data.dataset import BatchDict
 from ccbir.configuration import config
 from ccbir.data.morphomnist.perturb import (
     FractureArgsSampler,
@@ -7,7 +7,8 @@ from ccbir.data.morphomnist.perturb import (
     perturb_image,
 )
 from ccbir.tranforms import from_numpy_image
-from ccbir.util import leavesmap, star_apply
+from ccbir.util import leaves_map, star_apply
+from deepscm.morphomnist import perturb
 from deepscm.morphomnist.perturb import Fracture, Perturbation, Swelling
 from deepscm.datasets.morphomnist import (
     MorphoMNISTLike,
@@ -19,35 +20,33 @@ from more_itertools import unzip
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_is_fitted
-from toolz import assoc_in, assoc, valmap
+from toolz import assoc_in, assoc, valmap, keymap, compose
 import toolz.curried as C
 from torch import Tensor
-from typing import Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 import multiprocessing
 import numpy as np
 import pandas as pd
 import pickle
 import torch
 from torch.utils.data import default_convert
-import torchvision
 import tqdm
+from torch.utils.data import Dataset
 
 
-class MorphoMNIST(torchvision.datasets.VisionDataset):
-    # NOTE: for now just wrapper and adaptation of deepscm MorphoMNISTLike for
-    # consistency with torchvision and pytorch
+class MorphoMNIST(Dataset):
 
     def __init__(
         self,
         *,
         data_dir: str,
         train: bool,
-        transform=None,
+        transform: Callable[[BatchDict], BatchDict] = None,
         normalize_metrics: bool = False,
         binarize: bool = False,
         to_tensor: bool = True,
     ):
-        super().__init__(root=data_dir, transform=transform)
+        super().__init__()
 
         self.data_dir = data_dir
         self.train = train
@@ -97,17 +96,32 @@ class MorphoMNIST(torchvision.datasets.VisionDataset):
         if normalize_metrics:
             self.metrics = self._normalize_metrics(self.metrics)
 
+        items = BatchDict(dict(
+            image=self.images,
+            label=self.labels,
+            metrics=self.metrics,
+        ))
+
+        self.items = items if transform is None else transform(items)
+        assert isinstance(items, BatchDict), type(items)
+
+    # TODO: formalize the notion of an in memory dataset a bit more
+    def get_items(self) -> BatchDict:
+        return self.items
+
+    # TODO: make most of the following classmethods as they are just helpers
+
     def _raw_training_metrics(self):
         """Metrics from the training dataset without any normalisation"""
-
-        if self.train:
-            return self.metrics
-        else:
-            return self.__class__(data_dir=self.data_dir, train=True).metrics
+        return self.__class__(
+            data_dir=self.data_dir,
+            normalize_metrics=False,
+            train=True,
+        ).metrics
 
     def _load_scalers(self, recompute=True) -> Dict[str, StandardScaler]:
         # TODO: consider removing saving to file entirely
-        scalers_file = Path(self.root) / 'metrics_scalers.pkl'
+        scalers_file = Path(self.data_dir) / 'metrics_scalers.pkl'
 
         # load from disk scalers for each metric if they exits, otherwise fit
         # new scalers and save them to disk for future use
@@ -152,29 +166,20 @@ class MorphoMNIST(torchvision.datasets.VisionDataset):
         return len(self.images)
 
     def __getitem__(self, index):
-        item = dict(
-            image=self.images[index],
-            label=self.labels[index],
-            metrics=valmap(C.get(index), self.metrics),
-        )
+        return self.items[index]
 
-        if self.transform is not None:
-            item = self.transform(item)
-
-        return item
-
-    @staticmethod
-    def get_images_path(data_path: Path, train: bool):
+    @classmethod
+    def get_images_path(cls, data_path: Path, train: bool):
         prefix = "train" if train else "t10k"
         return data_path / f"{prefix}-images-idx3-ubyte.gz"
 
-    @staticmethod
-    def get_labels_path(data_path: Path, train: bool):
+    @classmethod
+    def get_labels_path(cls, data_path: Path, train: bool):
         prefix = "train" if train else "t10k"
         return data_path / f"{prefix}-labels-idx1-ubyte.gz"
 
-    @staticmethod
-    def get_morpho_path(data_path: Path, train: bool):
+    @classmethod
+    def get_morpho_path(cls, data_path: Path, train: bool):
         prefix = "train" if train else "t10k"
         return data_path / f"{prefix}-morpho.csv"
 
@@ -289,8 +294,8 @@ class PerturbedMorphoMNIST(MorphoMNIST):
         transform: Callable = None,
         **kwargs,
     ):
+
         self.perturbation_type = perturbation_type
-        self.train = train
 
         if data_dir is None:
             self.data_path = config.project_data_path / self.perturbation_name
@@ -329,9 +334,18 @@ class PerturbedMorphoMNIST(MorphoMNIST):
             self._cleanup_perturbation_data(perturbations_df)
         )
 
-        super().__init__(data_dir=str(self.data_path), train=train, **kwargs)
-        # FIXME: hacky overwritten transform fix
-        self.transform = transform
+        super().__init__(
+            data_dir=str(self.data_path),
+            train=train,
+            **kwargs,
+        )
+
+        self.items = self.items.set_feature(
+            keys=['perturbation_data'],
+            value=self.perturbations_data,
+        )
+
+        self.items = self.items if transform is None else transform(self.items)
 
     @classmethod
     def _cleanup_perturbation_data(
@@ -343,57 +357,41 @@ class PerturbedMorphoMNIST(MorphoMNIST):
         df.columns = df.columns.str.split('.', expand=True)
         df = df.rename(columns={np.NaN: ""})
 
-        data = dict()
-        for col_keys, col_values in df.items():
-            valid_keys = []
-            for k in col_keys:
-                assert isinstance(k, str), type(k)
-                if k == "":
-                    continue
-                else:
-                    if k.isnumeric():
-                        assert float(k).is_integer()
-                        valid_keys.append(int(k))
-                    else:
-                        valid_keys.append(k)
-            assert len(valid_keys) > 0
+        def parse_key(k: str) -> Union[str, int]:
+            if k.isnumeric():
+                assert float(k).is_integer()
+                return int(k)
+            else:
+                return k
 
-            values = col_values.to_numpy()
+        def valid_key(k: str) -> bool:
+            assert isinstance(k, str), type(k)
+            return k != ""
+
+        def default_convert_series(s: pd.Series) -> Any:
+            values = s.to_numpy()
             if np.issubdtype(values.dtype, np.floating):
                 default_float_dtype = torch.get_default_dtype()
-                values = torch.as_tensor(values, dtype=default_float_dtype)
+                return torch.as_tensor(values, dtype=default_float_dtype)
             else:
-                values = default_convert(values)
+                return default_convert(values)
 
-            data = assoc_in(data, valid_keys, values)
+        data = dict()
+        for col_keys, col_values in df.items():
+            keys = map(parse_key, filter(valid_key, col_keys))
+            values = default_convert_series(col_values)
+            data = assoc_in(data, keys, values)
 
         return data, df
 
-    @staticmethod
-    def get_perturbations_data_path(data_path: Path, train: bool) -> Path:
+    @classmethod
+    def get_perturbations_data_path(cls, data_path: Path, train: bool) -> Path:
         prefix = "train" if train else "t10k"
         return data_path / f"{prefix}-perturbations-data.csv"
 
     @property
     def perturbation_name(self) -> str:
         return self.perturbation_type.__name__.lower()
-
-    def __getitem__(self, index):
-        # FIXME: very hacky way to fix overwritten transform attribute: probably
-        # should prefer composition over inheritance
-        transform = self.transform
-        self.transform = None
-        item = super().__getitem__(index)
-        self.transform = transform
-
-        perturbation_data = leavesmap(C.get(index), self.perturbations_data)
-
-        item = assoc(item, 'perturbation_data', perturbation_data)
-
-        if self.transform is not None:
-            item = self.transform(item)
-
-        return item
 
 
 class PlainMorphoMNIST(MorphoMNIST):

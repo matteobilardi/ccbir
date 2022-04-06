@@ -81,6 +81,7 @@ class VQVAEExperiment:
             datamodule_ctor=partial(
                 PSFTwinNetDataModule,
                 embed_image=partial(vqvae_embed_image, vqvae),
+                num_workers=0,
             )
         )
 
@@ -122,7 +123,7 @@ class VQVAEExperiment:
         assert len(include_perturbations) > 0
         perturbations = sorted(include_perturbations)
 
-        _x, _y, psf_items = self.psf_data.dataset(train)[:num_points]
+        psf_items = self.psf_data.dataset(train).psf_items[:num_points]
 
         # concat z_q of all perturbations to compute TSNE for all embeddings
         z_q_all = torch.cat([
@@ -186,6 +187,7 @@ class PSFTwinNetExperiment:
             datamodule_ctor=partial(
                 PSFTwinNetDataModule,
                 embed_image=partial(vqvae_embed_image, vqvae),
+                num_workers=0,
             )
         )
 
@@ -208,6 +210,9 @@ class PSFTwinNetExperiment:
         train=False,
         dpi=300,
     ):
+        dataset = self.data.dataset(train)
+        X, y = dataset[item_idx]
+        psf_item = dataset.psf_items
         X, y, psf_item = self.data.dataset(train)[item_idx]
 
         original_image = psf_item['plain']['image'].unsqueeze(0)
@@ -228,7 +233,6 @@ class PSFTwinNetExperiment:
             fractured_image,
             self.vqvae_recon(fractured_embedding),
         ))
-
 
         # repeat input num_samples time
         X = {
@@ -257,7 +261,7 @@ class PSFTwinNetExperiment:
 
         # paired up images sampled via the twinnet
         images_hat = self.vqvae_recon(paired_up_embeddings)
-        
+
         print('original, swollen, swollen_vqvae, fractured, fractured_vqvae')
         show_tensor(make_grid(
             tensor=ground_truths,

@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 
-class SimpleDeepTwinNetComponent(nn.Module):
+class DeepTwinNetComponent(nn.Module):
     """Twin network for DAG: X -> Y <- Z that allows sampling from
     P(Y, Y* | X, X*, Z)"""
 
@@ -58,8 +58,8 @@ class SimpleDeepTwinNetComponent(nn.Module):
             linear_layer(self.data_dim),
             activation(),
             linear_layer(self.data_dim),
-            #activation(),
-            #linear_layer(),
+            # activation(),
+            # linear_layer(),
         ) if use_combine_net else None
 
         # to inject noise via multiplication/addition, we currently force
@@ -72,8 +72,8 @@ class SimpleDeepTwinNetComponent(nn.Module):
             linear_layer(self.data_dim),
             activation(),
             linear_layer(self.data_dim),
-            #activation(),
-            #linear_layer(self.data_dim),
+            # activation(),
+            # linear_layer(self.data_dim),
         )
 
         # NOTE: so far best architecture: obtained  MSE ~0.075, without
@@ -209,14 +209,14 @@ class TwinNet(pl.LightningModule):
         outcome_noise_dim: int,
         outcome_size: torch.Size,
         lr: float,
-        noise_inject_mode: Literal['concat', 'add', 'multiply'] = 'multiply',
+        noise_inject_mode: Literal['concat', 'add', 'multiply'] = 'concat',
         use_combine_net: bool = True,
         weight_sharing: bool = True,
         activation: ActivationFunc = 'mish',
         batch_norm: bool = False,
     ):
         super().__init__()
-        self.twin_net = SimpleDeepTwinNetComponent(
+        self.twin_net = DeepTwinNetComponent(
             treatment_dim=treatment_dim,
             confounders_dim=confounders_dim,
             outcome_noise_dim=outcome_noise_dim,
@@ -235,7 +235,7 @@ class TwinNet(pl.LightningModule):
         return self.twin_net(**x)
 
     def _step(self, batch):
-        X, y, _ = batch
+        X, y = batch
 
         factual_outcome_hat, counterfactual_outcome_hat = self(X)
 
@@ -280,8 +280,9 @@ class PSFTwinNet(TwinNet):
     def __init__(
         self,
         outcome_size: torch.Size,
+        # 4.952220800885215e-08
         # 0.0005,  # 1.7013748158991985e-06 # 4.4157044735331275e-05
-        lr: float = 0.0005  # 0.0005  # 1.7013748158991985e-06
+        lr: float = 4.952220800885215e-08  # 0.0005  # 0.0005  # 1.7013748158991985e-06
     ):
         super().__init__(
             outcome_size=outcome_size,

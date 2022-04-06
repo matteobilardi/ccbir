@@ -1,7 +1,5 @@
 from __future__ import annotations
-from ctypes import Union
 
-from attr import has
 from deepscm.morphomnist.morpho import ImageMorphology
 from deepscm.morphomnist.perturb import Fracture, Perturbation, Swelling
 from typing import Any, Dict, List, Mapping, Tuple, Type

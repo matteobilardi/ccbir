@@ -1,4 +1,5 @@
 from __future__ import annotations
+from ccbir.data.dataset import BatchDict
 from ccbir.data.morphomnist.dataset import MorphoMNIST
 
 from torch.utils.data import DataLoader, random_split
@@ -17,10 +18,10 @@ class MorphoMNISTDataModule(pl.LightningDataModule):
             Type[MorphoMNIST],
             Callable[..., MorphoMNIST]
         ]],
-        num_workers: int = multiprocessing.cpu_count(),
         batch_size: int,
         pin_memory: bool,
-        transform,
+        transform: Callable[[BatchDict], BatchDict],
+        num_workers: int = multiprocessing.cpu_count(),
     ):
         super().__init__()
         self.dataset_ctor = dataset_ctor

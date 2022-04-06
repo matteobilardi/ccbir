@@ -2,7 +2,7 @@ from ccbir.models.twinnet.data import PSFTwinNetDataModule
 from ccbir.models.twinnet.model import PSFTwinNet
 from ccbir.models.util import load_best_model
 from ccbir.models.vqvae.model import VQVAE
-from ccbir.util import maybe_unbatched_apply
+from ccbir.util import maybe_unbatched_apply, tune_lr
 from functools import partial
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.utilities.cli import LightningCLI
@@ -49,10 +49,12 @@ def main():
             ],
             max_epochs=2000,
             gpus=1,
+            # profiler='simple',
         ),
     )
 
     """
+
     lr_finder = cli.trainer.tuner.lr_find(
         model=cli.model,
         datamodule=cli.datamodule,
@@ -62,6 +64,7 @@ def main():
     )
 
     tune_lr(lr_finder, cli.model)
+
     """
 
     cli.trainer.fit(cli.model, datamodule=cli.datamodule)

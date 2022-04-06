@@ -1,23 +1,66 @@
+from __future__ import annotations
 from itertools import starmap, repeat
-from typing import List, Mapping, Tuple
+from typing import Any, Callable, Dict, Generic, Hashable, List, Mapping, Sequence, Tuple, TypeVar, Union
 from more_itertools import all_equal, first, interleave_evenly
 from torch.utils.data import Dataset, default_collate
-from toolz import valmap
+from toolz import valmap, curry, compose, do
 import toolz.curried as C
 
+from ccbir.util import leaves_map, strict_update_in
 
-class ZipDataset(Dataset):
-    def __init__(self, datasets: Mapping[str, Dataset]):
-        assert len(datasets) > 0
-        assert all_equal(map(len, datasets.values()))
-        super().__init__()
-        self.name_to_dataset = datasets
+BatchDictLike = Dict[Any, Union[Sequence, 'BatchDictLike']]
+
+
+class BatchDict:
+    def __init__(self, features: BatchDictLike):
+        assert isinstance(features, dict)
+        lengths = self._get_features_lengths(features)
+        assert len(lengths) > 0
+        assert all_equal(lengths)
+
+        self._len = lengths[0]
+        self._dict = features
 
     def __len__(self) -> int:
-        return len(first(self.name_to_dataset.values()))
+        return self._len
 
-    def __getitem__(self, index):
-        return valmap(C.get(index), self.name_to_dataset)
+    def __getitem__(self, index) -> Dict:
+        return leaves_map(C.get(index), self._dict)
+
+    def dict(self) -> Dict:
+        return self._dict
+
+    @curry
+    def map(self, func: Callable[[BatchDictLike], BatchDictLike]) -> BatchDict:
+        return BatchDict(func(self.dict()))
+
+    @classmethod
+    def zip(cls, batch_dicts: Dict[Any, BatchDict]) -> BatchDict:
+        return BatchDict(valmap(BatchDict.dict, batch_dicts))
+
+    @classmethod
+    def _get_features_lengths(cls, features: Any) -> List[int]:
+        lengths = []
+        _ = leaves_map(compose(lengths.append, len), features, strict=False)
+        return lengths
+
+    @curry
+    def map_feature(
+        self,
+        keys: Sequence,
+        func: Callable[..., Any],
+        strict: bool = True,
+    ) -> BatchDict:
+        update_in = strict_update_in if strict else C.update_in
+        return self.map(update_in(keys=keys, func=func))
+
+    @curry
+    def set_feature(
+        self,
+        keys: Sequence,
+        value: Sequence,
+    ) -> BatchDict:
+        return self.map(C.assoc_in(keys=keys, value=value))
 
 
 class InterleaveDataset(Dataset):

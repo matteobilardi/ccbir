@@ -1,6 +1,5 @@
-import numpy as np
-from ccbir.tranforms import DictTransform
-from ccbir.data.dataset import ZipDataset
+import shutil
+from ccbir.data.dataset import BatchDict, ZipDataset
 from ccbir.data.morphomnist.datamodule import MorphoMNISTDataModule
 from ccbir.data.morphomnist.dataset import FracturedMorphoMNIST, PlainMorphoMNIST, SwollenMorphoMNIST
 from functools import partial
@@ -9,10 +8,11 @@ from torch import Tensor
 from torch.distributions import Normal
 from torch.utils.data import Dataset
 from torchvision import transforms
-from typing import Callable, Dict, Literal, Sequence, Union
+from typing import Callable, Dict, Literal, Optional, Sequence, Tuple, Union
 import toolz.curried as C
 import torch
 import torch.nn.functional as F
+import diskcache
 
 
 class PSFTwinNetDataset(Dataset):
@@ -32,24 +32,89 @@ class PSFTwinNetDataset(Dataset):
         train: bool,
         transform=None,
         normalize_metrics: bool = True,
+        shared_cache: Optional[diskcache.Index] = None,
     ):
         super().__init__()
         self.embed_image = embed_image
+        self.train = train
+        self.transform = transform
+        self.normalize_metrics = normalize_metrics
 
+        # NOTE: *should* be free from race conditions
+        # as the DataModule runs a prepare in a single process,
+        # after which everyone should see the database in the shared cache
+        if shared_cache is None:
+            dataset = self._generate_dataset()
+        elif 'dataset' in shared_cache:
+            print('Loading dataset from cache')
+            dataset = shared_cache['dataset']
+        else:
+            print('Dataset not found in cache, generating it...')
+            shared_cache['dataset'] = dataset = self._generate_dataset()
+
+        # psf_items and outcome_noise are not really necessary but
+        # are kept as attributes for ease of debugging
+        # the outcome noise should be the same once the dataset is
+        # generated (we don't want to resample during training)
+        self.psf_items, self.outcome_noise, self.items = dataset
+
+    def get_items(self) -> BatchDict:
+        return self.items
+
+    def __len__(self):
+        return len(self.psf_items)
+
+    def __getitem__(self, index):
+        item = self.items[index]
+        return item['x'], item['y']
+
+    def _generate_dataset(self) -> Tuple[BatchDict, Tensor, BatchDict]:
         kwargs = dict(
-            train=train,
-            transform=transform,
-            normalize_metrics=normalize_metrics
+            train=self.train,
+            transform=self.transform,
+            normalize_metrics=self.normalize_metrics,
         )
-        self.psf_dataset = ZipDataset(dict(
-            plain=PlainMorphoMNIST(**kwargs),
-            swollen=SwollenMorphoMNIST(**kwargs),
-            fractured=FracturedMorphoMNIST(**kwargs),
+
+        psf_items = BatchDict.zip(dict(
+            plain=PlainMorphoMNIST(**kwargs).get_items(),
+            swollen=SwollenMorphoMNIST(**kwargs).get_items(),
+            fractured=FracturedMorphoMNIST(**kwargs).get_items(),
         ))
 
-        self.outcome_noise = self.sample_outcome_noise(
-            sample_shape=(len(self.psf_dataset), self.outcome_noise_dim),
+        psf_items_d = psf_items.dict()
+
+        outcome_noise = self.sample_outcome_noise(
+            sample_shape=(len(psf_items), self.outcome_noise_dim),
         )
+
+        swelling_data = psf_items_d['swollen']['perturbation_data']
+        fracture_data = psf_items_d['fractured']['perturbation_data']
+
+        swelling = self.perturbation_vector(**swelling_data)
+        fracture = self.perturbation_vector(**fracture_data)
+        label = self.one_hot_label(psf_items_d['plain']['label'])
+        metrics = self.metrics_vector(psf_items_d['plain']['metrics'])
+        label_and_metrics = torch.cat((label, metrics), dim=-1)
+
+        x = dict(
+            factual_treatment=swelling,
+            counterfactual_treatment=fracture,
+            confounders=label_and_metrics,
+            outcome_noise=outcome_noise,
+        )
+
+        swollen_z = self.embed_image(psf_items_d['swollen']['image'])
+        fractured_z = self.embed_image(psf_items_d['fractured']['image'])
+
+        y = dict(
+            factual_outcome=swollen_z,
+            counterfactual_outcome=fractured_z,
+        )
+
+        items = BatchDict(dict(x=x, y=y))
+        dataset = psf_items, outcome_noise, items
+
+        return dataset
 
     @classmethod
     def treatment_dim(cls) -> int:
@@ -110,7 +175,7 @@ class PSFTwinNetDataset(Dataset):
         assert all_equal(map(Tensor.size, elems))
         first = elems[0]
         dim = first.dim()
-        assert dim == 0 or dim == 1
+        assert dim == 0 or dim == 1, dim
 
         elems_ = [e.unsqueeze(-1) for e in elems]
         return torch.cat(elems_, dim=-1)
@@ -184,40 +249,6 @@ class PSFTwinNetDataset(Dataset):
             for metric_name in sorted(metrics)
         ])
 
-    def __len__(self):
-        return len(self.psf_dataset)
-
-    def __getitem__(self, index):
-        psf_item = self.psf_dataset[index]
-        outcome_noise = self.outcome_noise[index]
-
-        swelling_data = psf_item['swollen']['perturbation_data']
-        fracture_data = psf_item['fractured']['perturbation_data']
-
-        swelling = self.perturbation_vector(**swelling_data)
-        fracture = self.perturbation_vector(**fracture_data)
-        label = self.one_hot_label(psf_item['plain']['label'])
-        metrics = self.metrics_vector(psf_item['plain']['metrics'])
-        label_and_metrics = torch.cat((label, metrics), dim=-1)
-
-        x = dict(
-            factual_treatment=swelling,
-            counterfactual_treatment=fracture,
-            confounders=label_and_metrics,
-            outcome_noise=outcome_noise,
-        )
-
-        swollen_z = self.embed_image(psf_item['swollen']['image'])
-        fractured_z = self.embed_image(psf_item['fractured']['image'])
-
-        y = dict(
-            factual_outcome=swollen_z,
-            counterfactual_outcome=fractured_z,
-        )
-
-        # adding psf_item for ease of debugging but not necessary for training
-        return x, y, psf_item
-
 
 class PSFTwinNetDataModule(MorphoMNISTDataModule):
     # TODO: better class name
@@ -227,17 +258,32 @@ class PSFTwinNetDataModule(MorphoMNISTDataModule):
         embed_image: Callable[[Tensor], Tensor],
         batch_size: int = 64,
         pin_memory: bool = True,
+        **kwargs,
     ):
+        self.shared_cache = diskcache.Index(
+            f"/tmp/ccbir/{self.__class__.__name__.lower()}"
+        )
 
         super().__init__(
             dataset_ctor=partial(
                 PSFTwinNetDataset,
-                embed_image=embed_image
+                embed_image=embed_image,
+                shared_cache=self.shared_cache,
             ),
             batch_size=batch_size,
             pin_memory=pin_memory,
-            transform=DictTransform(
-                key='image',
-                transform_value=transforms.Normalize(mean=0.5, std=0.5),
+            transform=partial(
+                BatchDict.map_feature,
+                keys=['image'],
+                func=transforms.Normalize(mean=0.5, std=0.5),
             ),
+            **kwargs,
         )
+
+    def teardown(self, stage: Optional[str] = None) -> None:
+        super().teardown(stage)
+        # make sure to cleanup the cache so that repeated runs
+        # are guaranteed to regenerate the dataset but data is still
+        # cached during a single run
+        self.shared_cache.clear()
+        shutil.rmtree(self.shared_cache.directory)
