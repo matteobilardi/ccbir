@@ -1,5 +1,6 @@
 import shutil
-from ccbir.data.dataset import BatchDict, ZipDataset
+from ccbir.configuration import config
+from ccbir.data.dataset import BatchDict
 from ccbir.data.morphomnist.datamodule import MorphoMNISTDataModule
 from ccbir.data.morphomnist.dataset import FracturedMorphoMNIST, PlainMorphoMNIST, SwollenMorphoMNIST
 from functools import partial
@@ -41,16 +42,17 @@ class PSFTwinNetDataset(Dataset):
         self.normalize_metrics = normalize_metrics
 
         # NOTE: *should* be free from race conditions
-        # as the DataModule runs a prepare in a single process,
+        # as the DataModule runs prepare_setup in a single process,
         # after which everyone should see the database in the shared cache
+        cache_key = 'train' if train else 'test'
         if shared_cache is None:
             dataset = self._generate_dataset()
-        elif 'dataset' in shared_cache:
+        elif cache_key in shared_cache:
             print('Loading dataset from cache')
-            dataset = shared_cache['dataset']
+            dataset = shared_cache[cache_key]
         else:
-            print('Dataset not found in cache, generating it...')
-            shared_cache['dataset'] = dataset = self._generate_dataset()
+            print('Data not found in cache, generating it...')
+            shared_cache[cache_key] = dataset = self._generate_dataset()
 
         # psf_items and outcome_noise are not really necessary but
         # are kept as attributes for ease of debugging
@@ -261,7 +263,7 @@ class PSFTwinNetDataModule(MorphoMNISTDataModule):
         **kwargs,
     ):
         self.shared_cache = diskcache.Index(
-            f"/tmp/ccbir/{self.__class__.__name__.lower()}"
+            str(config.temporary_data_path / self.__class__.__name__.lower())
         )
 
         super().__init__(
@@ -279,11 +281,3 @@ class PSFTwinNetDataModule(MorphoMNISTDataModule):
             ),
             **kwargs,
         )
-
-    def teardown(self, stage: Optional[str] = None) -> None:
-        super().teardown(stage)
-        # make sure to cleanup the cache so that repeated runs
-        # are guaranteed to regenerate the dataset but data is still
-        # cached during a single run
-        self.shared_cache.clear()
-        shutil.rmtree(self.shared_cache.directory)

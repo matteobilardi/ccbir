@@ -1,4 +1,5 @@
 from pathlib import Path
+import shutil
 import sys
 import pytorch_lightning as pl
 from typing import Type
@@ -62,6 +63,15 @@ class Config:
     @property
     def _submodules_path(self) -> Path:
         return self.project_root / 'submodules'
+
+    @property
+    def temporary_data_path(self) -> Path:
+        tmp = Path('/tmp/ccbir')
+        tmp.mkdir(parents=True, exist_ok=True)
+        return tmp
+
+    def clear_temporary_data(self):
+        shutil.rmtree(str(self.temporary_data_path))
 
     def pythonpath_fix(self):
         """Extends current $PYTHONPATH environement variable to include modules

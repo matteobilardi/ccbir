@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader, random_split
 from typing import Callable, Optional
 import multiprocessing
 import pytorch_lightning as pl
+import torch
 
 from typing import Type, Union
 
@@ -32,8 +33,8 @@ class MorphoMNISTDataModule(pl.LightningDataModule):
 
     def prepare_data(self):
         # check that the data lives on disk (else generate it)
-        self.dataset_ctor(train=True)
-        self.dataset_ctor(train=False)
+        self.dataset_ctor(train=True, transform=self.transform)
+        self.dataset_ctor(train=False, transform=self.transform)
 
     def setup(self, stage: Optional[str] = None):
         mnist_train = self.dataset_ctor(train=True, transform=self.transform)
@@ -46,7 +47,10 @@ class MorphoMNISTDataModule(pl.LightningDataModule):
         num_val = len(mnist_train) // 10
         num_train = len(mnist_train) - num_val
         self.mnist_train, self.mnist_val = random_split(
-            mnist_train, [num_train, num_val]
+            dataset=mnist_train,
+            lengths=[num_train, num_val],
+            # fix generator for reproducible split
+            generator=torch.Generator().manual_seed(42),
         )
 
     def train_dataloader(self) -> DataLoader:

@@ -6,11 +6,11 @@ from ccbir.models.vqvae.model import VQVAE
 from functools import cached_property, partial
 from more_itertools import interleave
 from sklearn.manifold import TSNE
-from torch import Tensor
+from torch import Tensor, frac
 from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision.utils import make_grid
-from typing import Callable, List, Literal, Type, Union
+from typing import Callable, Dict, List, Literal, Optional, Type, Union
 import matplotlib.pyplot as plt
 import pandas as pd
 import pytorch_lightning as pl
@@ -33,8 +33,63 @@ def show_tensor(tensor_img, dpi=150):
     plt.imshow(pil_from_tensor(tensor_img), cmap='gray', vmin=0, vmax=255)
 
 
+def _plot_tsne(
+    latents_for_perturbation: Dict[
+        Literal['plain', 'swollen', 'fractured'],
+        Tensor,
+    ],
+    labels: Tensor,
+    perplexity: int = 30,
+    n_iter: int = 1000,
+):
+    perturbations = sorted(latents_for_perturbation.keys())
+    assert len(perturbations) > 0
+    latents_all = torch.cat([
+        latents_for_perturbation[p] for p in perturbations
+    ])
+    print('Computing TSNE...')
+    tsne = TSNE(perplexity=perplexity, n_jobs=-1)
+    latents_embedded_all = torch.as_tensor(tsne.fit_transform(
+        # latents need to be flattened to vectors to be processed by TSNE
+        # in case they are not already flat
+        latents_all.flatten(start_dim=1).detach().numpy()
+    ))
+
+    latents_embedded_for_perturbation = dict(zip(
+        perturbations,
+        torch.chunk(latents_embedded_all, len(perturbations)),
+    ))
+
+    df = pd.concat((
+        pd.DataFrame(dict(
+            perturbation=[perturbation] * len(latents_embedded),
+            digit=labels,
+            x=latents_embedded[:, 0],
+            y=latents_embedded[:, 1],
+        ))
+        for perturbation, latents_embedded in
+        latents_embedded_for_perturbation.items()
+    ))
+
+    df = df.sort_values(by=['digit', 'perturbation'])
+
+    plt.figure(dpi=200)
+    # sns.set_style('white')
+    g = sns.scatterplot(
+        data=df,
+        x='x',
+        y='y',
+        hue='digit',
+        style='perturbation',
+        legend='full',
+        palette='bright',
+    )
+    g.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+    g.set(title=f"TSNE: {perplexity=}, {n_iter=}")
+
+
 class ExperimentData:
-    """Provides convenient and fast access to the exact databases used by a
+    """Provides convenient and fast access to the exact data used by a
     datamodule"""
 
     def __init__(
@@ -71,18 +126,44 @@ class ExperimentData:
         return self._train_dataset if train else self._test_dataset
 
 
+class VQVAEExperimentData(ExperimentData):
+    def __init__(self):
+        super().__init__(VQVAEMorphoMNISTDataModule)
+
+
+class TwinNetExperimentData(ExperimentData):
+    def __init__(self, embed_image):
+        super().__init__(
+            datamodule_ctor=partial(
+                PSFTwinNetDataModule,
+                embed_image=embed_image,
+                num_workers=0,
+            )
+        )
+
+    def psf_items(self, train: bool, index: Optional[int] = None) -> Dict:
+        # ugly accesses to train subset dataset
+        dataset = self.dataset(train)
+        if index is None:
+            return (
+                dataset.dataset.psf_items[dataset.indices] if train else
+                dataset.psf_items.dict()
+            )
+        else:
+            return (
+                dataset.dataset.psf_items[dataset.indices[index]] if train else
+                dataset.psf_items[index]
+            )
+
+
 class VQVAEExperiment:
     def __init__(self, vqvae: VQVAE):
         self.vqvae = vqvae
-        self.data = ExperimentData(VQVAEMorphoMNISTDataModule)
+        self.data = VQVAEExperimentData()
 
         # TODO: hacky - this should not be needed in VQVAE experiments
-        self.psf_data = ExperimentData(
-            datamodule_ctor=partial(
-                PSFTwinNetDataModule,
-                embed_image=partial(vqvae_embed_image, vqvae),
-                num_workers=0,
-            )
+        self.twinnet_data = TwinNetExperimentData(
+            embed_image=partial(vqvae_embed_image, vqvae),
         )
 
     def show_vqvae_recons(
@@ -110,69 +191,28 @@ class VQVAEExperiment:
             _x_hat, _z_e_x, z_q_x = self.vqvae(x)
             return z_q_x
 
+    # TODO: use perturbation types instead of literals
+
     def plot_vqvae_tsne(
         self,
         include_perturbations: List[Literal[
-            'plain', 'swollen', 'fractured'
+            'swollen', 'fractured'
         ]] = ['plain', 'swollen', 'fractured'],
         perplexity: int = 30,
         n_iter: int = 1000,
         num_points: int = 500,
         train: bool = False,
     ):
-        assert len(include_perturbations) > 0
-        perturbations = sorted(include_perturbations)
+        psf_items = self.twinnet_data.psf_items(train, slice(num_points))
 
-        psf_items = self.psf_data.dataset(train).psf_items[:num_points]
-
-        # concat z_q of all perturbations to compute TSNE for all embeddings
-        z_q_all = torch.cat([
-            self._vqvae_z_q(
-                psf_items[perturbation]['image']
-            )
-            for perturbation in perturbations
-        ])
-
-        print('Computing TSNE...')
-        tsne = TSNE(perplexity=perplexity, n_jobs=-1)
-        z_q_embedded_all = torch.as_tensor(tsne.fit_transform(
-            # latents need to be flattened to vectors to be processed by TSNE
-            z_q_all.flatten(start_dim=1).detach().numpy()
-        ))
-
-        z_q_embedded_for_perturbation = dict(zip(
-            perturbations,
-            torch.chunk(z_q_embedded_all, len(perturbations)),
-        ))
+        latents_for_perturbation = {
+            perturbation: self._vqvae_z_q(psf_items[perturbation]['image'])
+            for perturbation in include_perturbations
+        }
 
         labels = psf_items['plain']['label']
 
-        df = pd.concat((
-            pd.DataFrame(dict(
-                perturbation=[perturbation] * len(z_q_embedded),
-                digit=labels,
-                x=z_q_embedded[:, 0],
-                y=z_q_embedded[:, 1],
-            ))
-            for perturbation, z_q_embedded in
-            z_q_embedded_for_perturbation.items()
-        ))
-
-        df = df.sort_values(by=['digit', 'perturbation'])
-
-        plt.figure(dpi=200)
-        # sns.set_style('white')
-        g = sns.scatterplot(
-            data=df,
-            x='x',
-            y='y',
-            hue='digit',
-            style='perturbation',
-            legend='full',
-            palette='bright',
-        )
-        g.legend(loc='center left', bbox_to_anchor=(1, 0.5))
-        g.set(title=f"TSNE: {perplexity=}, {n_iter=}")
+        _plot_tsne(latents_for_perturbation, labels, perplexity, n_iter)
 
 
 class PSFTwinNetExperiment:
@@ -183,12 +223,8 @@ class PSFTwinNetExperiment:
     ):
         self.vqvae = vqvae
         self.twinnet = twinnet
-        self.data = ExperimentData(
-            datamodule_ctor=partial(
-                PSFTwinNetDataModule,
-                embed_image=partial(vqvae_embed_image, vqvae),
-                num_workers=0,
-            )
+        self.data = TwinNetExperimentData(
+            embed_image=partial(vqvae_embed_image, vqvae),
         )
 
     def vqvae_recon(self, z_e_x: Tensor) -> Tensor:
@@ -212,9 +248,7 @@ class PSFTwinNetExperiment:
     ):
         dataset = self.data.dataset(train)
         X, y = dataset[item_idx]
-        psf_item = dataset.psf_items
-        X, y, psf_item = self.data.dataset(train)[item_idx]
-
+        psf_item = self.data.psf_items(train, item_idx)
         original_image = psf_item['plain']['image'].unsqueeze(0)
         swollen_image = psf_item['swollen']['image'].unsqueeze(0)
         fractured_image = psf_item['fractured']['image'].unsqueeze(0)
@@ -278,6 +312,22 @@ class PSFTwinNetExperiment:
             dpi=dpi,
         )
 
-    def plot_twinnet_tsne(self):
-        # TODO
-        raise NotImplementedError
+    def plot_twinnet_tsne(
+        self,
+        perplexity: int = 30,
+        n_iter: int = 1000,
+        num_points: int = 500,
+        train: bool = False,
+    ):
+        # for each original image, generate factual and counterfactual
+        # embedding, flatten, run tsne split and plot
+        x, _y = self.data.dataset(train)[:num_points]
+        swollen, fractured = self.twinnet.forward(x)
+        latents_for_perturbations = dict(
+            swollen=swollen,
+            fractured=fractured,
+        )
+        psf_items = self.data.psf_items(train, slice(num_points))
+        labels = psf_items['plain']['label']
+
+        _plot_tsne(latents_for_perturbations, labels, perplexity, n_iter)

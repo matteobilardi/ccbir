@@ -1,3 +1,4 @@
+from ccbir.configuration import config
 from ccbir.models.twinnet.data import PSFTwinNetDataModule
 from ccbir.models.twinnet.model import PSFTwinNet
 from ccbir.models.util import load_best_model
@@ -8,6 +9,8 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.utilities.cli import LightningCLI
 from torch import Tensor
 import torch
+import torch.multiprocessing
+import shutil
 
 
 def vqvae_embed_image(vqvae: VQVAE, image: Tensor):
@@ -18,10 +21,12 @@ def vqvae_embed_image(vqvae: VQVAE, image: Tensor):
 
 
 def main():
-
     vqvae = load_best_model(VQVAE)
     embedding_size = vqvae.encoder_net(torch.rand((64, 1, 28, 28))).shape[1:]
     print(f"{embedding_size}")
+
+    # clean up possible database caches from interrupted previous run
+    #config.clear_temporary_data()
 
     # FIXME: initialsiation, traning, saving and storing a bit hacky currently
     # Functions signatures needed by LightningCLI so can't use functools.partial

@@ -1,6 +1,7 @@
 from __future__ import annotations
 from itertools import starmap, repeat
 from typing import Any, Callable, Dict, Generic, Hashable, List, Mapping, Sequence, Tuple, TypeVar, Union
+from typing_extensions import Self
 from more_itertools import all_equal, first, interleave_evenly
 from torch.utils.data import Dataset, default_collate
 from toolz import valmap, curry, compose, do
@@ -25,18 +26,18 @@ class BatchDict:
         return self._len
 
     def __getitem__(self, index) -> Dict:
-        return leaves_map(C.get(index), self._dict)
+        return leaves_map(C.get(index), self.dict())
 
     def dict(self) -> Dict:
         return self._dict
 
     @curry
-    def map(self, func: Callable[[BatchDictLike], BatchDictLike]) -> BatchDict:
-        return BatchDict(func(self.dict()))
+    def map(self, func: Callable[[BatchDictLike], BatchDictLike]) -> Self:
+        return self.__class__(func(self.dict()))
 
     @classmethod
-    def zip(cls, batch_dicts: Dict[Any, BatchDict]) -> BatchDict:
-        return BatchDict(valmap(BatchDict.dict, batch_dicts))
+    def zip(cls, batch_dicts: Dict[Any, BatchDict]) -> Self:
+        return cls(valmap(cls.dict, batch_dicts))
 
     @classmethod
     def _get_features_lengths(cls, features: Any) -> List[int]:
@@ -48,9 +49,9 @@ class BatchDict:
     def map_feature(
         self,
         keys: Sequence,
-        func: Callable[..., Any],
+        func: Callable[[Sequence], Sequence],
         strict: bool = True,
-    ) -> BatchDict:
+    ) -> Self:
         update_in = strict_update_in if strict else C.update_in
         return self.map(update_in(keys=keys, func=func))
 
@@ -59,7 +60,7 @@ class BatchDict:
         self,
         keys: Sequence,
         value: Sequence,
-    ) -> BatchDict:
+    ) -> Self:
         return self.map(C.assoc_in(keys=keys, value=value))
 
 
