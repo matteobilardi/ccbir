@@ -1,13 +1,10 @@
-from ccbir.data.dataset import BatchDict
+from datetime import datetime
+from multiprocessing.sharedctypes import Value
+import time
+from ccbir.data.util import BatchDict, tensor_from_numpy_image, default_convert_series
 from ccbir.configuration import config
-from ccbir.data.morphomnist.perturb import (
-    FractureArgsSampler,
-    PerturbationArgsSampler,
-    SwellingArgsSampler,
-    perturb_image,
-)
-from ccbir.tranforms import from_numpy_image
-from ccbir.util import leaves_map, star_apply
+from ccbir.data.morphomnist.perturb import perturb_image
+from ccbir.util import leaves_map, reset_random_seed, star_apply
 from deepscm.morphomnist import perturb
 from deepscm.morphomnist.perturb import Fracture, Perturbation, Swelling
 from deepscm.datasets.morphomnist import (
@@ -31,7 +28,7 @@ import pickle
 import torch
 from torch.utils.data import default_convert
 import tqdm
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, ConcatDataset
 
 
 class MorphoMNIST(Dataset):
@@ -61,7 +58,8 @@ class MorphoMNIST(Dataset):
         self.images = images.copy()
 
         if to_tensor:
-            self.images = from_numpy_image(self.images, has_channel_dim=False)
+            self.images = tensor_from_numpy_image(
+                self.images, has_channel_dim=False)
 
         if binarize:
             if not to_tensor:
@@ -108,6 +106,12 @@ class MorphoMNIST(Dataset):
     # TODO: formalize the notion of an in memory dataset a bit more
     def get_items(self) -> BatchDict:
         return self.items
+
+    def __len__(self) -> int:
+        return len(self.images)
+
+    def __getitem__(self, index):
+        return self.items[index]
 
     # TODO: make most of the following classmethods as they are just helpers
 
@@ -162,68 +166,138 @@ class MorphoMNIST(Dataset):
 
         return normalized_metrics
 
-    def __len__(self) -> int:
-        return len(self.images)
-
-    def __getitem__(self, index):
-        return self.items[index]
+    @classmethod
+    def path_prefix(cls, train: bool) -> str:
+        return 'train' if train else 't10k'
 
     @classmethod
     def get_images_path(cls, data_path: Path, train: bool):
-        prefix = "train" if train else "t10k"
-        return data_path / f"{prefix}-images-idx3-ubyte.gz"
+        return data_path / f"{cls.path_prefix(train)}-images-idx3-ubyte.gz"
 
     @classmethod
     def get_labels_path(cls, data_path: Path, train: bool):
-        prefix = "train" if train else "t10k"
-        return data_path / f"{prefix}-labels-idx1-ubyte.gz"
+        return data_path / f"{cls.path_prefix(train)}-labels-idx1-ubyte.gz"
 
     @classmethod
     def get_morpho_path(cls, data_path: Path, train: bool):
-        prefix = "train" if train else "t10k"
-        return data_path / f"{prefix}-morpho.csv"
+        return data_path / f"{cls.path_prefix(train)}-morpho.csv"
 
 
-class PerturbedMorphoMNISTGenerator:
-    """ Generate MorphoMNIST dataset after perturbations of a (single) given
-    perturbation_type initilised with arguments obtained by sampling from the
-    given perturbation_sampler and applied to the original MNIST dataset. """
-
+class PerturbedMorphoMNIST(MorphoMNIST):
     def __init__(
         self,
-        perturbation_type: Type[Perturbation],
-        perturbation_args_sampler: PerturbationArgsSampler,
-        original_data_dir: str = str(config.original_mnist_data_path),
+        train: bool,
+        perturbation_type: Optional[Type[Perturbation]] = None,
+        perturbation_args: Optional[Dict] = None,
+        transform: Optional[Callable[[BatchDict], BatchDict]] = None,
+        data_dir: Optional[str] = None,
+        original_mnist_data_dir: Optional[str] = None,
+        **kwargs,
     ):
+        if data_dir is None:
+            assert issubclass(perturbation_type, Perturbation)
+            folder_name = perturbation_type.__name__.lower()
+            data_path = config.project_data_path / folder_name
+        else:
+            data_path = Path(data_dir)
 
-        if not issubclass(
-            perturbation_args_sampler.perturbation_type,
-            perturbation_type
-        ):
-            raise TypeError(
-                f"{perturbation_args_sampler.perturbation_type=} is not a "
-                f"subclass of {perturbation_type=}"
+        images_path = self.get_images_path(data_path, train)
+        if not images_path.exists():
+            print(f"{images_path} not found, generating perturbed dataset...")
+            if (perturbation_type is None or perturbation_args is None):
+                raise ValueError(
+                    'must specify perturbation type and args when dataset does'
+                    'not exits'
+                )
+
+            original_data_path = (
+                Path(original_mnist_data_dir) if original_mnist_data_dir else
+                config.original_mnist_data_path
             )
 
-        self.perturbation_type = perturbation_type
-        self.perturbation_args_sampler = perturbation_args_sampler
-        self.original_data_dir = original_data_dir
+            self._generate_dataset(
+                original_data_path=original_data_path,
+                output_path=data_path,
+                train=train,
+                perturbation_type=perturbation_type,
+                perturbation_args=perturbation_args,
+            )
 
-    def generate_dataset(
-        self,
-        out_dir: str,
-        *,
+        super().__init__(
+            data_dir=str(data_path),
+            train=train,
+            **kwargs,
+        )
+        self.data_path = data_path
+        # self.perturbation_type = perturbation_type
+        # self.perturbation_args = perturbation_args
+        self.perturbation_data = self._load_perturbation_data(data_path, train)
+        self.items = self.items.set_feature(
+            keys=['perturbation_data'],
+            value=self.perturbation_data,
+        )
+
+        self.items = self.items if transform is None else transform(self.items)
+
+    @ classmethod
+    def get_perturbations_data_path(cls, data_path: Path, train: bool) -> Path:
+        return data_path / f"{cls.path_prefix(train)}-perturbations-data.csv"
+
+    @ classmethod
+    def _load_perturbation_data(
+        cls,
+        data_path: Path,
         train: bool,
-    ) -> Tuple[np.ndarray, pd.DataFrame]:
-        original_dataset = MorphoMNISTLike(self.original_data_dir, train=train)
+    ) -> Dict:
+        df = pd.read_csv(
+            cls.get_perturbations_data_path(data_path, train),
+            index_col='index',
+        )
+
+        df.columns = df.columns.str.split('.', expand=True)
+        df = df.rename(columns={np.NaN: ""})
+
+        def parse_key(k: str) -> Union[str, int]:
+            if k.isnumeric():
+                assert float(k).is_integer()
+                return int(k)
+            else:
+                return k
+
+        def valid_key(k: str) -> bool:
+            assert isinstance(k, str), type(k)
+            return k != ""
+
+        data = dict()
+        for col_keys, col_values in df.items():
+            keys = map(parse_key, filter(valid_key, col_keys))
+            values = default_convert_series(col_values)
+            data = assoc_in(data, keys, values)
+
+        return data
+
+    @classmethod
+    def _generate_dataset(
+        cls,
+        original_data_path: Path,
+        output_path: Path,
+        train: bool,
+        perturbation_type: Type[Perturbation],
+        perturbation_args: Dict[str, Any],
+    ):
+        output_path.mkdir(parents=True, exist_ok=True)
+        original_dataset = MorphoMNISTLike(
+            str(original_data_path),
+            train=train
+        )
         original_images = original_dataset.images
         num_images = len(original_images)
-        perturbation_types = repeat(self.perturbation_type, num_images)
-        perturbations_args = (
-            self.perturbation_args_sampler
-            .sample_args(num_images)
-            .to_dict(orient='records')
-        )
+
+        # NOTE: these should be made BatchDict to support arbitrary
+        # perturbations and perturbations' args in a single dataset
+        # but since we don't need that for now, just repeating the perturbation
+        perturbation_types = repeat(perturbation_type, num_images)
+        perturbations_args = repeat(perturbation_args, num_images)
 
         with multiprocessing.Pool() as pool:
             perturbed_images_gen = pool.imap(
@@ -252,13 +326,6 @@ class PerturbedMorphoMNISTGenerator:
             errors='ignore',
         )
 
-        out_path = Path(out_dir)
-        out_path.mkdir(parents=True, exist_ok=True)
-
-        perturbations_data_path = (
-            PerturbedMorphoMNIST.get_perturbations_data_path(out_path, train)
-        )
-
         # TODO? For now no need to compute metrics for perturbed images
         # but might become necessary in the future
         dummy_empty_metrics = pd.DataFrame(index=range(len(perturbed_images)))
@@ -266,132 +333,46 @@ class PerturbedMorphoMNISTGenerator:
             images=perturbed_images,
             labels=original_dataset.labels,
             metrics=dummy_empty_metrics,
-            root_dir=out_dir,
+            root_dir=str(output_path),
             train=train,
         )
 
-        perturbations_data.to_csv(perturbations_data_path, index_label='index')
+        perturbations_data.to_csv(
+            path_or_buf=cls.get_perturbations_data_path(output_path, train),
+            index_label='index'
+        )
 
-        return perturbed_images, perturbations_data
 
+class RepeatedPerturbationDataset(ConcatDataset):
+    """Augment a perturbed dataset by reapplying the same perturbations to
+    MNIST (relying on the internal sampling of the perturbations for
+    sample diversity across repeats)"""
 
-class PerturbedMorphoMNIST(MorphoMNIST):
-    """ MorphoMNIST dataset on which perturbations of the single
-    perturbation_type have been performed.
-
-    If the database doesn't already exist at the given data_dir, a dataset
-    generator must be given.
-    """
+    # NOTE: if implementing perturbation data normalization, I need to be
+    # careful to normalize over the whole concatanated dataset rather than
+    # over each dataset in isolation
 
     def __init__(
         self,
-        perturbation_type: Type[Perturbation],
-        *,
-        train: bool,
-        data_dir: Optional[str] = None,
-        generator: Optional[PerturbedMorphoMNISTGenerator] = None,
-        overwrite: bool = False,
-        transform: Callable = None,
+        repeat: int,
+        dataset_ctor: Callable[..., PerturbedMorphoMNIST],
         **kwargs,
     ):
+        assert repeat >= 1, 'No point in repeating dataset less than once'
+        dataset_to_repeat = dataset_ctor(**kwargs)
+        base_path = dataset_to_repeat.data_path.parent
+        base_filename = dataset_to_repeat.data_path.name
 
-        self.perturbation_type = perturbation_type
+        datasets = [dataset_to_repeat]
+        for repeat_idx in range(repeat):
+            data_dir = str(base_path / f"{base_filename}_repeat_{repeat_idx}")
+            # we need varying randomness to ensure that the perturbation
+            # location sampler produces different samples for each dataset
+            reset_random_seed()
+            repeat_dataset = dataset_ctor(**{**kwargs, 'data_dir': data_dir})
+            datasets.append(repeat_dataset)
 
-        if data_dir is None:
-            self.data_path = config.project_data_path / self.perturbation_name
-        else:
-            self.data_path = Path(data_dir).resolve(strict=True)
-
-        images_path = self.get_images_path(self.data_path, train)
-        perturbations_data_path = (
-            self.get_perturbations_data_path(self.data_path, train)
-        )
-
-        # Load dataset or generate it if it does not exist
-        exists = images_path.exists() and perturbations_data_path.exists()
-        if exists and not overwrite:
-            perturbations_df = (
-                pd.read_csv(perturbations_data_path, index_col='index')
-            )
-        elif generator is None:
-            raise ValueError(
-                f"generator cannot be None when the dataset does not exist"
-                f"already in {data_dir=} or when overwrite=True"
-            )
-        else:
-            dataset_type = 'train' if train else 'test'
-            print(
-                f"Generating {dataset_type} dataset for perturbation "
-                f"{perturbation_type}"
-            )
-
-            _images, perturbations_df = generator.generate_dataset(
-                out_dir=str(self.data_path),
-                train=train,
-            )
-
-        self.perturbations_data, self._perturbations_df = (
-            self._cleanup_perturbation_data(perturbations_df)
-        )
-
-        super().__init__(
-            data_dir=str(self.data_path),
-            train=train,
-            **kwargs,
-        )
-
-        self.items = self.items.set_feature(
-            keys=['perturbation_data'],
-            value=self.perturbations_data,
-        )
-
-        self.items = self.items if transform is None else transform(self.items)
-
-    @classmethod
-    def _cleanup_perturbation_data(
-        cls,
-        raw_df: pd.DataFrame
-    ) -> Tuple[Dict, pd.DataFrame]:
-        # unflatten and cleanup perturbations data
-        df = raw_df
-        df.columns = df.columns.str.split('.', expand=True)
-        df = df.rename(columns={np.NaN: ""})
-
-        def parse_key(k: str) -> Union[str, int]:
-            if k.isnumeric():
-                assert float(k).is_integer()
-                return int(k)
-            else:
-                return k
-
-        def valid_key(k: str) -> bool:
-            assert isinstance(k, str), type(k)
-            return k != ""
-
-        def default_convert_series(s: pd.Series) -> Any:
-            values = s.to_numpy()
-            if np.issubdtype(values.dtype, np.floating):
-                default_float_dtype = torch.get_default_dtype()
-                return torch.as_tensor(values, dtype=default_float_dtype)
-            else:
-                return default_convert(values)
-
-        data = dict()
-        for col_keys, col_values in df.items():
-            keys = map(parse_key, filter(valid_key, col_keys))
-            values = default_convert_series(col_values)
-            data = assoc_in(data, keys, values)
-
-        return data, df
-
-    @classmethod
-    def get_perturbations_data_path(cls, data_path: Path, train: bool) -> Path:
-        prefix = "train" if train else "t10k"
-        return data_path / f"{prefix}-perturbations-data.csv"
-
-    @property
-    def perturbation_name(self) -> str:
-        return self.perturbation_type.__name__.lower()
+        super().__init__(datasets)
 
 
 class PlainMorphoMNIST(MorphoMNIST):
@@ -406,24 +387,36 @@ class PlainMorphoMNIST(MorphoMNIST):
 class SwollenMorphoMNIST(PerturbedMorphoMNIST):
     def __init__(
         self,
-        generator=PerturbedMorphoMNISTGenerator(
-            Swelling, SwellingArgsSampler()
+        *,
+        perturbation_args=dict(
+            strength=3.0,
+            radius=7.0,
         ),
         **kwargs,
     ):
-        super().__init__(Swelling, **kwargs, generator=generator)
+        super().__init__(
+            perturbation_type=Swelling,
+            perturbation_args=perturbation_args,
+            **kwargs,
+        )
 
 
 class FracturedMorphoMNIST(PerturbedMorphoMNIST):
     def __init__(
         self,
         *,
-        generator=PerturbedMorphoMNISTGenerator(
-            Fracture, FractureArgsSampler()
+        perturbation_args=dict(
+            thickness=1.5,
+            prune=2.0,
+            num_frac=3,
         ),
         **kwargs
     ):
-        super().__init__(Fracture, **kwargs, generator=generator)
+        super().__init__(
+            perturbation_type=Fracture,
+            perturbation_args=perturbation_args,
+            **kwargs,
+        )
 
 
 class LocalPerturbationsMorphoMNIST(MorphoMNIST):

@@ -1,11 +1,15 @@
 from __future__ import annotations
 from itertools import starmap, repeat
+from more_itertools import all_equal, first, interleave_evenly
+from toolz import valmap, curry, compose, do
+from torch.utils.data import Dataset, default_collate, default_convert
 from typing import Any, Callable, Dict, Generic, Hashable, List, Mapping, Sequence, Tuple, TypeVar, Union
 from typing_extensions import Self
-from more_itertools import all_equal, first, interleave_evenly
-from torch.utils.data import Dataset, default_collate
-from toolz import valmap, curry, compose, do
+import numpy as np
+import pandas as pd
 import toolz.curried as C
+import torch
+from torch import Tensor
 
 from ccbir.util import leaves_map, strict_update_in
 
@@ -13,6 +17,8 @@ BatchDictLike = Dict[Any, Union[Sequence, 'BatchDictLike']]
 
 
 class BatchDict:
+    """Dataframe like data structure that holds """
+
     def __init__(self, features: BatchDictLike):
         assert isinstance(features, dict)
         lengths = self._get_features_lengths(features)
@@ -91,3 +97,40 @@ class InterleaveDataset(Dataset):
         else:
             dataset, item_idx = dataset_with_item_idx
             return dataset[item_idx]
+
+
+def default_convert_series(s: pd.Series) -> Union[np.ndarray, Tensor]:
+    """Attempts conversion to torch tensor type, casting floats to default
+    torch datatype (float32)"""
+
+    values = s.to_numpy()
+    if np.issubdtype(values.dtype, np.floating):
+        default_float_dtype = torch.get_default_dtype()
+        return torch.as_tensor(values, dtype=default_float_dtype)
+    else:
+        return default_convert(values)
+
+
+def tensor_from_numpy_image(
+    image: np.ndarray,
+    has_channel_dim: bool = True,
+) -> Tensor:
+    """Converts possibly batched, and possibly in range [0, 255] numpy images of
+    shape HxWxC into a tensor image (also possibly batched) of shape CxHxW and
+    range [0.0, 1.0]"""
+
+    # enforce presence of channel dimension
+    if not has_channel_dim:
+        image = image[..., np.newaxis]
+
+    assert image.ndim == 4 or image.ndim == 3
+
+    # Following based on code from torchivion/transforms/functional.py
+    default_float_dtype = torch.get_default_dtype()
+    image = np.moveaxis(image, [-3, -2, -1], [-2, -1, -3])
+    img = torch.from_numpy(image).contiguous()
+    # backward compatibility
+    if isinstance(img, torch.ByteTensor):
+        return img.to(dtype=default_float_dtype).div(255)
+    else:
+        return img

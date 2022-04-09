@@ -66,7 +66,7 @@ class Config:
 
     @property
     def temporary_data_path(self) -> Path:
-        tmp = Path('/tmp/ccbir')
+        tmp = Path('/vol/bitbucket/mb8318/ccbir/tmp')
         tmp.mkdir(parents=True, exist_ok=True)
         return tmp
 
@@ -83,7 +83,7 @@ class Config:
             self.project_root / 'ccbir/pytorch_vqvae',  # TODO: avoid copy-paste
             self._submodules_path / 'deepscm',
         ]
-        sys.path.extend(str(p) for p in paths)
+        sys.path.extend(map(str, paths))
 
 
 config = Config()

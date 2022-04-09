@@ -26,7 +26,7 @@ def main():
     print(f"{embedding_size}")
 
     # clean up possible database caches from interrupted previous run
-    #config.clear_temporary_data()
+    # config.clear_temporary_data()
 
     # FIXME: initialsiation, traning, saving and storing a bit hacky currently
     # Functions signatures needed by LightningCLI so can't use functools.partial

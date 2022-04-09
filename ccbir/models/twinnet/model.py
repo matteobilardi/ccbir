@@ -209,7 +209,7 @@ class TwinNet(pl.LightningModule):
         outcome_noise_dim: int,
         outcome_size: torch.Size,
         lr: float,
-        noise_inject_mode: Literal['concat', 'add', 'multiply'] = 'multiply',
+        noise_inject_mode: Literal['concat', 'add', 'multiply'] = 'concat',
         use_combine_net: bool = True,
         weight_sharing: bool = True,
         activation: ActivationFunc = 'mish',
@@ -282,7 +282,8 @@ class PSFTwinNet(TwinNet):
         outcome_size: torch.Size,
         # 4.952220800885215e-08
         # 0.0005,  # 1.7013748158991985e-06 # 4.4157044735331275e-05
-        lr: float = 0.0005  # 4.952220800885215e-08  # 0.0005  # 0.0005  # 1.7013748158991985e-06
+        # 0.001  # 4.952220800885215e-08  # 0.0005  # 0.0005  # 1.7013748158991985e-06
+        lr: float = 0.001
     ):
         super().__init__(
             outcome_size=outcome_size,
