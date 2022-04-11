@@ -1,8 +1,9 @@
 from functools import partial
+from multiprocessing.sharedctypes import Value
 from pathlib import Path
-from typing import Callable, Dict, Hashable, Iterable, Literal, Optional, Sequence, TypeVar, Union
+from typing import Any, Callable, Dict, Hashable, Iterable, Literal, Optional, Sequence, TypeVar, Union
 from torch import Tensor
-from toolz import curry, valmap
+from toolz import curry, valmap, merge_with, identity
 import toolz.curried as C
 import pytorch_lightning as pl
 import matplotlib.pyplot as plt
@@ -77,6 +78,45 @@ def strict_update_in(
     _ = toolz.get_in(keys, d, no_default=True)
 
     return toolz.update_in(d, keys, func)
+
+
+K = TypeVar('K', bound=Hashable)
+V = TypeVar('V')
+NestedDict = Dict[K, Union[V, 'NestedDict']]
+
+DictOfFunctions = NestedDict[Hashable, Callable]
+
+
+def _dict_funcs_apply(args):
+    if len(args) == 1:
+        # dict of functions didn't contain key for corresponding data key so
+        # assume identity
+        [data] = args
+        return data
+    elif len(args) == 2:
+        [fn, data] = args
+        if isinstance(fn, Callable):
+            return fn(data)
+        else:
+            assert isinstance(fn, dict)
+            assert isinstance(data, dict)
+            assert set(fn.keys()).issubset(set(data.keys()))
+
+            return merge_with(_dict_funcs_apply, fn, data)
+    else:
+        raise RuntimeError('Unreachable')
+
+
+@curry
+def dict_funcs_apply(
+    dict_of_funcs: DictOfFunctions,
+    d: Dict,
+) -> Dict:
+    assert isinstance(dict_of_funcs, dict)
+    assert isinstance(d, dict)
+    assert set(dict_of_funcs.keys()).issubset(set(d.keys()))
+
+    return _dict_funcs_apply([dict_of_funcs, d])
 
 
 def tune_lr(

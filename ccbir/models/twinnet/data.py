@@ -1,4 +1,3 @@
-from pandas import read_parquet
 from ccbir.configuration import config
 from ccbir.data.util import BatchDict, random_split_repeated
 from ccbir.data.morphomnist.datamodule import MorphoMNISTDataModule
@@ -33,6 +32,7 @@ class PSFTwinNetDataset(Dataset):
         repeats: int = 1,
         transform: Callable[[BatchDict], BatchDict] = None,
         normalize_metrics: bool = True,
+        normalize_perturbation_data: bool = True,
         shared_cache: Optional[diskcache.Index] = None,
     ):
         super().__init__()
@@ -40,6 +40,7 @@ class PSFTwinNetDataset(Dataset):
         self.train = train
         self.transform = transform
         self.normalize_metrics = normalize_metrics
+        self.normalize_perturbation_data = normalize_perturbation_data
         self.repeats = repeats
 
         # NOTE: *should* be free from race conditions
@@ -47,13 +48,13 @@ class PSFTwinNetDataset(Dataset):
         # after which everyone should see the database in the shared cache
         cache_key = 'train' if train else 'test'
         if shared_cache is None:
-            dataset = self._generate_dataset()
+            dataset = self._generate_dataset(repeats)
         elif cache_key in shared_cache:
             print('Loading dataset from cache')
             dataset = shared_cache[cache_key]
         else:
-            print('Data not found in cache, generating it...')
-            shared_cache[cache_key] = dataset = self._generate_dataset()
+            print('Dataset not found in cache, generating it...')
+            shared_cache[cache_key] = dataset = self._generate_dataset(repeats)
 
         # psf_items and outcome_noise are not really necessary but
         # are kept as attributes for ease of debugging
@@ -84,9 +85,10 @@ class PSFTwinNetDataset(Dataset):
             generator=generator
         )
 
+    # TODO: make classmethod
     def _generate_dataset(
         self,
-        repeats: int = 1,
+        repeats: int,
     ) -> Tuple[BatchDict, Tensor, BatchDict]:
         kwargs = dict(
             train=self.train,
@@ -95,7 +97,11 @@ class PSFTwinNetDataset(Dataset):
         )
 
         plain = PlainMorphoMNIST(**kwargs).get_items().ncycles(repeats)
-        perturbed_kwargs = {**kwargs, 'repeats': repeats}
+        perturbed_kwargs = {
+            **kwargs,
+            'normalize_perturbation_data': self.normalize_perturbation_data,
+            'repeats': repeats,
+        }
         swollen = SwollenMorphoMNIST(**perturbed_kwargs).get_items()
         fractured = FracturedMorphoMNIST(**perturbed_kwargs).get_items()
 

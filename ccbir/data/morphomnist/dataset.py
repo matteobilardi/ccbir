@@ -2,12 +2,13 @@ from datetime import datetime
 from email.generator import Generator
 from multiprocessing.sharedctypes import Value
 import time
+from typing_extensions import Self
 
 from typer import Option
-from ccbir.data.util import BatchDict, random_split_repeated, tensor_from_numpy_image, default_convert_series
+from ccbir.data.util import BatchDict, random_split_repeated, standard_scaler_for, tensor_from_numpy_image, default_convert_series
 from ccbir.configuration import config
 from ccbir.data.morphomnist.perturb import perturb_image
-from ccbir.util import leaves_map, reset_random_seed, star_apply, tensor_ncycles
+from ccbir.util import DictOfFunctions, dict_funcs_apply, leaves_map, reset_random_seed, star_apply, tensor_ncycles
 from deepscm.morphomnist import perturb
 from deepscm.morphomnist.perturb import Fracture, Perturbation, Swelling
 from deepscm.datasets.morphomnist import (
@@ -21,10 +22,10 @@ from more_itertools import ncycles, unzip
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_is_fitted
-from toolz import assoc_in, assoc, valmap, keymap, compose
+from toolz import assoc_in, assoc, valmap, keymap, compose, identity
 import toolz.curried as C
 from torch import Tensor, default_generator
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
 import multiprocessing
 import numpy as np
 import pandas as pd
@@ -63,7 +64,9 @@ class MorphoMNIST(Dataset):
 
         if to_tensor:
             self.images = tensor_from_numpy_image(
-                self.images, has_channel_dim=False)
+                image=self.images,
+                has_channel_dim=False
+            )
 
         if binarize:
             if not to_tensor:
@@ -141,47 +144,13 @@ class MorphoMNIST(Dataset):
             train=True,
         ).metrics
 
-    def _load_scalers(self, recompute=True) -> Dict[str, StandardScaler]:
-        # TODO: consider removing saving to file entirely
-        scalers_file = Path(self.data_dir) / 'metrics_scalers.pkl'
-
-        # load from disk scalers for each metric if they exits, otherwise fit
-        # new scalers and save them to disk for future use
-        if scalers_file.exists() and not recompute:
-            with open(scalers_file, 'rb') as f:
-                scaler_for_metric = pickle.load(f)
-
-            for scaler in scaler_for_metric.values():
-                check_is_fitted(scaler)
-        else:
-            # never fit a scaler on the test data!
-            fittable_metrics = self._raw_training_metrics()
-
-            scaler_for_metric = {}
-            for metric, metric_values in fittable_metrics.items():
-                scaler = StandardScaler()
-                # standard scaler requires 2d array hence view
-                scaler.fit(metric_values.view(-1, 1).numpy())
-                scaler_for_metric[metric] = scaler
-
-            scalers_file.write_bytes(pickle.dumps(scaler_for_metric))
-
-        return scaler_for_metric
-
     def _normalize_metrics(
         self,
         metrics: Dict[str, Tensor]
     ) -> Dict[str, Tensor]:
-        scaler_for_metric = self._load_scalers()
-        normalized_metrics = {
-            metric: torch.from_numpy(
-                scaler_for_metric[metric].transform(
-                    metric_values.view(-1, 1).numpy()
-                ).flatten()
-            )
-            for metric, metric_values in metrics.items()
-        }
-
+        fittable_data = self._raw_training_metrics()
+        scalers = leaves_map(standard_scaler_for, fittable_data)
+        normalized_metrics = dict_funcs_apply(scalers, metrics)
         return normalized_metrics
 
     @classmethod
@@ -205,6 +174,7 @@ class PerturbedMorphoMNIST(MorphoMNIST):
     def __init__(
         self,
         train: bool,
+        normalize_perturbation_data: bool = False,
         perturbation_type: Optional[Type[Perturbation]] = None,
         perturbation_args: Optional[Dict] = None,
         transform: Optional[Callable[[BatchDict], BatchDict]] = None,
@@ -259,6 +229,11 @@ class PerturbedMorphoMNIST(MorphoMNIST):
         # self.perturbation_type = perturbation_type
         # self.perturbation_args = perturbation_args
         self.perturbation_data = self._load_perturbation_data(data_path, train)
+        if normalize_perturbation_data:
+            self.perturbation_data = self._normalize_perturbation_data(
+                self.perturbation_data
+            )
+
         self.items = self.items.set_feature(
             keys=['perturbation_data'],
             value=self.perturbation_data,
@@ -315,6 +290,19 @@ class PerturbedMorphoMNIST(MorphoMNIST):
             data = assoc_in(data, keys, values)
 
         return data
+
+    def _raw_training_perturbation_data(self) -> Dict:
+        return self.__class__(
+            train=True,
+            data_dir=str(self.data_path),
+            normalize_perturbation_data=False,
+        ).perturbation_data
+
+    def _normalize_perturbation_data(self, perturbation_data: Dict) -> Dict:
+        fittable_data = self._raw_training_perturbation_data()
+        scalers = leaves_map(standard_scaler_for, fittable_data)
+        normalized_data = dict_funcs_apply(scalers, perturbation_data)
+        return normalized_data
 
     @classmethod
     def _generate_dataset(

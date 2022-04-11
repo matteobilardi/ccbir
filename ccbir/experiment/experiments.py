@@ -6,9 +6,10 @@ from ccbir.models.vqvae.model import VQVAE
 from functools import cached_property, partial
 from more_itertools import interleave
 from sklearn.manifold import TSNE
-from torch import Tensor, frac
-from torch.utils.data import Dataset
+from torch import Tensor
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+from toolz import first
 from torchvision.utils import make_grid
 from typing import Callable, Dict, List, Literal, Optional, Type, Union
 import matplotlib.pyplot as plt
@@ -125,6 +126,12 @@ class ExperimentData:
     def dataset(self, train: bool) -> Dataset:
         return self._train_dataset if train else self._test_dataset
 
+    def dataloader(self, train: bool):
+        if train:
+            return self.datamodule.train_dataloader()
+        else:
+            return self.datamodule.test_dataloader()
+
 
 class VQVAEExperimentData(ExperimentData):
     def __init__(self):
@@ -137,7 +144,7 @@ class TwinNetExperimentData(ExperimentData):
             datamodule_ctor=partial(
                 PSFTwinNetDataModule,
                 embed_image=embed_image,
-                num_workers=0,
+                num_workers=1,
             )
         )
 
@@ -172,7 +179,7 @@ class VQVAEExperiment:
         train: bool = False,
         dpi: int = 200,
     ):
-        images = self.data.dataset(train)[:num_images]
+        images = first(self.data.dataloader(train))[:num_images]
 
         with torch.no_grad():
             recons, _z_e, _z_q = self.vqvae(images)

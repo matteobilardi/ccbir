@@ -51,6 +51,13 @@ def main():
                     save_top_k=3,
                     save_last=True,
                 ),
+                ModelCheckpoint(
+                    monitor='train_loss',
+                    filename='twinnet-{epoch:03d}-{train_loss:.7f}',
+                    save_top_k=3,
+                    save_last=False,
+                    save_on_train_epoch_end=True,
+                ),
             ],
             max_epochs=2000,
             gpus=1,

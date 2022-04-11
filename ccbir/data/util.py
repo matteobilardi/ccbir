@@ -1,9 +1,9 @@
 from __future__ import annotations
-import array
 from itertools import starmap, repeat
 import math
 from more_itertools import all_equal, first, interleave_evenly
-from toolz import valmap, curry, compose, do
+from sklearn.preprocessing import StandardScaler
+from toolz import valmap, curry, compose, do, identity
 from torch.utils.data import Dataset, default_collate, default_convert, Subset
 from typing import Any, Callable, Dict, Generator, Generic, Hashable, List, Mapping, Sequence, Tuple, TypeVar, Union
 from typing_extensions import Self
@@ -13,9 +13,9 @@ import toolz.curried as C
 import torch
 from torch import Tensor, default_generator
 
-from ccbir.util import array_like_ncycles, numpy_ncycles, leaves_map, strict_update_in, tensor_ncycles
+from ccbir.util import NestedDict, array_like_ncycles, numpy_ncycles, leaves_map, strict_update_in, tensor_ncycles
 
-BatchDictLike = Dict[Any, Union[Sequence, 'BatchDictLike']]
+BatchDictLike = NestedDict[Hashable, Sequence]
 
 
 class BatchDict:
@@ -162,6 +162,27 @@ def default_convert_series(s: pd.Series) -> Union[np.ndarray, Tensor]:
         return torch.as_tensor(values, dtype=default_float_dtype)
     else:
         return default_convert(values)
+
+
+def standard_scaler_for(seq: Sequence) -> Callable[[Sequence], Sequence]:
+    """If :seq is a tensor, returns a scaling function that applies the standard
+    scaler transformation fitted on the tensor data, otherwise returns the
+    identity function"""
+
+    if isinstance(seq, Tensor):
+        assert seq.dim() == 1, seq.dim()
+        scaler = StandardScaler()
+        scaler.fit(seq.view(-1, 1).numpy())
+
+        def scale(t: Tensor):
+            assert seq.dim() == 1, seq.dim()
+            return torch.from_numpy(
+                scaler.transform(t.view(-1, 1).numpy()).flatten()
+            )
+
+        return scale
+    else:
+        return identity
 
 
 def tensor_from_numpy_image(

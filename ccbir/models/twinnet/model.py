@@ -263,6 +263,7 @@ class TwinNet(pl.LightningModule):
 
     def training_step(self, batch, _batch_idx):
         loss, _metrics = self._step(batch)
+        self.log('train_loss', loss.item(), on_step=True, on_epoch=True)
         return loss
 
     def validation_step(self, batch, _batch_idx):
