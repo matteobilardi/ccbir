@@ -1,29 +1,35 @@
 from __future__ import annotations
+import array
 from itertools import starmap, repeat
+import math
 from more_itertools import all_equal, first, interleave_evenly
 from toolz import valmap, curry, compose, do
-from torch.utils.data import Dataset, default_collate, default_convert
-from typing import Any, Callable, Dict, Generic, Hashable, List, Mapping, Sequence, Tuple, TypeVar, Union
+from torch.utils.data import Dataset, default_collate, default_convert, Subset
+from typing import Any, Callable, Dict, Generator, Generic, Hashable, List, Mapping, Sequence, Tuple, TypeVar, Union
 from typing_extensions import Self
 import numpy as np
 import pandas as pd
 import toolz.curried as C
 import torch
-from torch import Tensor
+from torch import Tensor, default_generator
 
-from ccbir.util import leaves_map, strict_update_in
+from ccbir.util import array_like_ncycles, numpy_ncycles, leaves_map, strict_update_in, tensor_ncycles
 
 BatchDictLike = Dict[Any, Union[Sequence, 'BatchDictLike']]
 
 
 class BatchDict:
-    """Dataframe like data structure that holds """
+    """Convenince dataframe-like data structure that contains possibly nested
+    dictionary of equally sized sequence objects (ideally tensors). This is
+    similar to the batch that would yielded by a dataloader during training for
+    a dataset whose __getitem__ method returns a dictionary object. """
 
     def __init__(self, features: BatchDictLike):
         assert isinstance(features, dict)
         lengths = self._get_features_lengths(features)
         assert len(lengths) > 0
         assert all_equal(lengths)
+        super().__init__()
 
         self._len = lengths[0]
         self._dict = features
@@ -37,21 +43,12 @@ class BatchDict:
     def dict(self) -> Dict:
         return self._dict
 
-    @curry
     def map(self, func: Callable[[BatchDictLike], BatchDictLike]) -> Self:
         return self.__class__(func(self.dict()))
 
-    @classmethod
-    def zip(cls, batch_dicts: Dict[Any, BatchDict]) -> Self:
-        return cls(valmap(cls.dict, batch_dicts))
+    def map_features(self, func: Callable[[Sequence], Sequence]) -> Self:
+        return self.map(leaves_map(func))
 
-    @classmethod
-    def _get_features_lengths(cls, features: Any) -> List[int]:
-        lengths = []
-        _ = leaves_map(compose(lengths.append, len), features, strict=False)
-        return lengths
-
-    @curry
     def map_feature(
         self,
         keys: Sequence,
@@ -61,13 +58,25 @@ class BatchDict:
         update_in = strict_update_in if strict else C.update_in
         return self.map(update_in(keys=keys, func=func))
 
-    @curry
     def set_feature(
         self,
         keys: Sequence,
         value: Sequence,
     ) -> Self:
         return self.map(C.assoc_in(keys=keys, value=value))
+
+    def ncycles(self, n) -> Self:
+        return self.map_features(array_like_ncycles(n=n))
+
+    @classmethod
+    def zip(cls, batch_dicts: Dict[Any, BatchDict]) -> Self:
+        return cls(valmap(cls.dict, batch_dicts))
+
+    @classmethod
+    def _get_features_lengths(cls, features: BatchDictLike) -> List[int]:
+        lengths = []
+        _ = leaves_map(compose(lengths.append, len), features, strict=False)
+        return lengths
 
 
 class InterleaveDataset(Dataset):
@@ -97,6 +106,50 @@ class InterleaveDataset(Dataset):
         else:
             dataset, item_idx = dataset_with_item_idx
             return dataset[item_idx]
+
+
+def random_split_repeated(
+    dataset: Dataset,
+    train_ratio: float,
+    repeats: int,
+    generator: Generator = default_generator,
+) -> Tuple[Subset, Subset]:
+    """Randomly split (in a why that avoids data leakage) an augmented :dataset
+    that was obtained by cyclying :repeats times an original dataset. If
+    :repeats is 1, this function is equivalent to random_split as it's assumed
+    that the dataset hasn't been augmented.
+
+    If we split naively via torch random_split, two or more different items
+    obtained from augmenting the same original item could occur in both the
+    validation set and in the training set, we should be avoided for fair
+    evaluation."""
+
+    assert repeats >= 1
+
+    original_len_f = len(dataset) / repeats
+    assert original_len_f.is_integer()
+    original_len = int(original_len_f)
+
+    num_train = math.ceil(original_len * train_ratio)
+    num_val = original_len - num_train
+    assert num_train > 0 and num_val > 0
+
+    shuffled_orig_idxs = torch.randperm(original_len, generator=generator)
+    orig_train_idxs, orig_val_idxs = (
+        torch.split(shuffled_orig_idxs, [num_train, num_val])
+    )
+
+    train_idxs = []
+    val_idxs = []
+    for cycle_idx in range(repeats):
+        shift = cycle_idx * original_len
+        train_idxs.append(orig_train_idxs + shift)
+        val_idxs.append(orig_val_idxs + shift)
+
+    train_idxs = torch.cat(train_idxs)
+    val_idxs = torch.cat(val_idxs)
+
+    return Subset(dataset, train_idxs), Subset(dataset, val_idxs)
 
 
 def default_convert_series(s: pd.Series) -> Union[np.ndarray, Tensor]:

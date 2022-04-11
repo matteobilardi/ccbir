@@ -1,16 +1,15 @@
-import shutil
+from pandas import read_parquet
 from ccbir.configuration import config
-from ccbir.data.dataset import BatchDict
+from ccbir.data.util import BatchDict, random_split_repeated
 from ccbir.data.morphomnist.datamodule import MorphoMNISTDataModule
 from ccbir.data.morphomnist.dataset import FracturedMorphoMNIST, PlainMorphoMNIST, SwollenMorphoMNIST
 from functools import partial
 from more_itertools import all_equal
-from torch import Tensor
+from torch import Tensor, default_generator
 from torch.distributions import Normal
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 from torchvision import transforms
-from typing import Callable, Dict, Literal, Optional, Sequence, Tuple, Union
-import toolz.curried as C
+from typing import Callable, Dict, Generator, Literal, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn.functional as F
 import diskcache
@@ -31,7 +30,8 @@ class PSFTwinNetDataset(Dataset):
         *,
         embed_image: Callable[[Tensor], Tensor],
         train: bool,
-        transform=None,
+        repeats: int = 1,
+        transform: Callable[[BatchDict], BatchDict] = None,
         normalize_metrics: bool = True,
         shared_cache: Optional[diskcache.Index] = None,
     ):
@@ -40,6 +40,7 @@ class PSFTwinNetDataset(Dataset):
         self.train = train
         self.transform = transform
         self.normalize_metrics = normalize_metrics
+        self.repeats = repeats
 
         # NOTE: *should* be free from race conditions
         # as the DataModule runs prepare_setup in a single process,
@@ -70,17 +71,38 @@ class PSFTwinNetDataset(Dataset):
         item = self.items[index]
         return item['x'], item['y']
 
-    def _generate_dataset(self) -> Tuple[BatchDict, Tensor, BatchDict]:
+    def train_val_random_split(
+        self,
+        train_ratio: float,
+        generator: Generator = default_generator,
+    ) -> Tuple[Subset, Subset]:
+        assert self.train
+        return random_split_repeated(
+            dataset=self,
+            train_ratio=train_ratio,
+            repeats=self.repeats,
+            generator=generator
+        )
+
+    def _generate_dataset(
+        self,
+        repeats: int = 1,
+    ) -> Tuple[BatchDict, Tensor, BatchDict]:
         kwargs = dict(
             train=self.train,
             transform=self.transform,
             normalize_metrics=self.normalize_metrics,
         )
 
+        plain = PlainMorphoMNIST(**kwargs).get_items().ncycles(repeats)
+        perturbed_kwargs = {**kwargs, 'repeats': repeats}
+        swollen = SwollenMorphoMNIST(**perturbed_kwargs).get_items()
+        fractured = FracturedMorphoMNIST(**perturbed_kwargs).get_items()
+
         psf_items = BatchDict.zip(dict(
-            plain=PlainMorphoMNIST(**kwargs).get_items(),
-            swollen=SwollenMorphoMNIST(**kwargs).get_items(),
-            fractured=FracturedMorphoMNIST(**kwargs).get_items(),
+            plain=plain,
+            swollen=swollen,
+            fractured=fractured,
         ))
 
         psf_items_d = psf_items.dict()

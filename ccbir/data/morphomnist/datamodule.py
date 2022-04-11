@@ -1,5 +1,5 @@
 from __future__ import annotations
-from ccbir.data.dataset import BatchDict
+from ccbir.data.util import BatchDict, random_split_repeated
 from ccbir.data.morphomnist.dataset import MorphoMNIST
 
 from torch.utils.data import DataLoader, random_split
@@ -43,12 +43,8 @@ class MorphoMNISTDataModule(pl.LightningDataModule):
             transform=self.transform,
         )
 
-        # Reserve split for validation
-        num_val = len(mnist_train) // 10
-        num_train = len(mnist_train) - num_val
-        self.mnist_train, self.mnist_val = random_split(
-            dataset=mnist_train,
-            lengths=[num_train, num_val],
+        self.mnist_train, self.mnist_val = mnist_train.train_val_random_split(
+            train_ratio=0.9,
             # fix generator for reproducible split
             generator=torch.Generator().manual_seed(42),
         )

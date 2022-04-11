@@ -84,7 +84,7 @@ class VQVAE(pl.LightningModule):
         commit_loss_weight: float = 0.25,  # 1.0,  # beta
         lr: float = 2e-4,
         activation: ActivationFunc = 'mish',
-        width_scale: int = 8,  # influences width of convolutional layers
+        width_scale: int = 16  # 8,  # influences width of convolutional layers
     ):
         super().__init__()
         self.in_channels = in_channels

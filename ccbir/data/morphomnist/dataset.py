@@ -1,10 +1,13 @@
 from datetime import datetime
+from email.generator import Generator
 from multiprocessing.sharedctypes import Value
 import time
-from ccbir.data.util import BatchDict, tensor_from_numpy_image, default_convert_series
+
+from typer import Option
+from ccbir.data.util import BatchDict, random_split_repeated, tensor_from_numpy_image, default_convert_series
 from ccbir.configuration import config
 from ccbir.data.morphomnist.perturb import perturb_image
-from ccbir.util import leaves_map, reset_random_seed, star_apply
+from ccbir.util import leaves_map, reset_random_seed, star_apply, tensor_ncycles
 from deepscm.morphomnist import perturb
 from deepscm.morphomnist.perturb import Fracture, Perturbation, Swelling
 from deepscm.datasets.morphomnist import (
@@ -12,14 +15,15 @@ from deepscm.datasets.morphomnist import (
     load_morphomnist_like,
     save_morphomnist_like,
 )
+from torch.utils.data import Subset, random_split
 from itertools import repeat
-from more_itertools import unzip
+from more_itertools import ncycles, unzip
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_is_fitted
 from toolz import assoc_in, assoc, valmap, keymap, compose
 import toolz.curried as C
-from torch import Tensor
+from torch import Tensor, default_generator
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 import multiprocessing
 import numpy as np
@@ -103,7 +107,21 @@ class MorphoMNIST(Dataset):
         self.items = items if transform is None else transform(items)
         assert isinstance(items, BatchDict), type(items)
 
+    def train_val_random_split(
+        self,
+        train_ratio: float,
+        generator: Optional[Generator] = default_generator,
+    ) -> Tuple[Subset, Subset]:
+        assert self.train
+        return random_split_repeated(
+            dataset=self,
+            train_ration=train_ratio,
+            repeats=1,
+            generator=generator
+        )
+
     # TODO: formalize the notion of an in memory dataset a bit more
+
     def get_items(self) -> BatchDict:
         return self.items
 
@@ -192,11 +210,18 @@ class PerturbedMorphoMNIST(MorphoMNIST):
         transform: Optional[Callable[[BatchDict], BatchDict]] = None,
         data_dir: Optional[str] = None,
         original_mnist_data_dir: Optional[str] = None,
+        repeats: int = 1,
         **kwargs,
     ):
+
         if data_dir is None:
             assert issubclass(perturbation_type, Perturbation)
             folder_name = perturbation_type.__name__.lower()
+
+            assert repeats > 0, repeats
+            if repeats > 1:
+                folder_name = f"{folder_name}_repeats_{repeats}"
+
             data_path = config.project_data_path / folder_name
         else:
             data_path = Path(data_dir)
@@ -221,6 +246,7 @@ class PerturbedMorphoMNIST(MorphoMNIST):
                 train=train,
                 perturbation_type=perturbation_type,
                 perturbation_args=perturbation_args,
+                repeats=repeats,
             )
 
         super().__init__(
@@ -228,6 +254,7 @@ class PerturbedMorphoMNIST(MorphoMNIST):
             train=train,
             **kwargs,
         )
+        self.repeats = repeats
         self.data_path = data_path
         # self.perturbation_type = perturbation_type
         # self.perturbation_args = perturbation_args
@@ -239,11 +266,24 @@ class PerturbedMorphoMNIST(MorphoMNIST):
 
         self.items = self.items if transform is None else transform(self.items)
 
-    @ classmethod
+    def train_val_random_split(
+        self,
+        train_ratio: float,
+        generator: Generator = default_generator,
+    ) -> Tuple[Subset, Subset]:
+        assert self.train
+        return random_split_repeated(
+            dataset=self,
+            train_ration=train_ratio,
+            repeats=self.repeats,
+            generator=generator
+        )
+
+    @classmethod
     def get_perturbations_data_path(cls, data_path: Path, train: bool) -> Path:
         return data_path / f"{cls.path_prefix(train)}-perturbations-data.csv"
 
-    @ classmethod
+    @classmethod
     def _load_perturbation_data(
         cls,
         data_path: Path,
@@ -284,6 +324,7 @@ class PerturbedMorphoMNIST(MorphoMNIST):
         train: bool,
         perturbation_type: Type[Perturbation],
         perturbation_args: Dict[str, Any],
+        repeats: int,
     ):
         output_path.mkdir(parents=True, exist_ok=True)
         original_dataset = MorphoMNISTLike(
@@ -291,18 +332,29 @@ class PerturbedMorphoMNIST(MorphoMNIST):
             train=train
         )
         original_images = original_dataset.images
-        num_images = len(original_images)
+        original_num_imgs = len(original_images)
 
         # NOTE: these should be made BatchDict to support arbitrary
         # perturbations and perturbations' args in a single dataset
         # but since we don't need that for now, just repeating the perturbation
-        perturbation_types = repeat(perturbation_type, num_images)
-        perturbations_args = repeat(perturbation_args, num_images)
+        perturbations_type = repeat(perturbation_type, original_num_imgs)
+        perturbations_args = repeat(perturbation_args, original_num_imgs)
+
+        # handle potential dataset augmentation by repeating the perturbations
+        perturbations_to_perform = ncycles(
+            iterable=zip(
+                original_images,
+                perturbations_type,
+                perturbations_args,
+            ),
+            n=repeats,
+        )
+        labels = tensor_ncycles(original_dataset.labels, n=repeats)
 
         with multiprocessing.Pool() as pool:
             perturbed_images_gen = pool.imap(
                 star_apply(perturb_image),
-                zip(original_images, perturbation_types, perturbations_args),
+                perturbations_to_perform,
                 chunksize=128,
             )
 
@@ -310,7 +362,7 @@ class PerturbedMorphoMNIST(MorphoMNIST):
             # blocks for correct result order)
             perturbed_images_gen = tqdm.tqdm(
                 iterable=perturbed_images_gen,
-                total=num_images,
+                total=original_num_imgs * repeats,
                 unit='img',
                 ascii=True,
             )
@@ -331,7 +383,7 @@ class PerturbedMorphoMNIST(MorphoMNIST):
         dummy_empty_metrics = pd.DataFrame(index=range(len(perturbed_images)))
         save_morphomnist_like(
             images=perturbed_images,
-            labels=original_dataset.labels,
+            labels=labels,
             metrics=dummy_empty_metrics,
             root_dir=str(output_path),
             train=train,
@@ -341,38 +393,6 @@ class PerturbedMorphoMNIST(MorphoMNIST):
             path_or_buf=cls.get_perturbations_data_path(output_path, train),
             index_label='index'
         )
-
-
-class RepeatedPerturbationDataset(ConcatDataset):
-    """Augment a perturbed dataset by reapplying the same perturbations to
-    MNIST (relying on the internal sampling of the perturbations for
-    sample diversity across repeats)"""
-
-    # NOTE: if implementing perturbation data normalization, I need to be
-    # careful to normalize over the whole concatanated dataset rather than
-    # over each dataset in isolation
-
-    def __init__(
-        self,
-        repeat: int,
-        dataset_ctor: Callable[..., PerturbedMorphoMNIST],
-        **kwargs,
-    ):
-        assert repeat >= 1, 'No point in repeating dataset less than once'
-        dataset_to_repeat = dataset_ctor(**kwargs)
-        base_path = dataset_to_repeat.data_path.parent
-        base_filename = dataset_to_repeat.data_path.name
-
-        datasets = [dataset_to_repeat]
-        for repeat_idx in range(repeat):
-            data_dir = str(base_path / f"{base_filename}_repeat_{repeat_idx}")
-            # we need varying randomness to ensure that the perturbation
-            # location sampler produces different samples for each dataset
-            reset_random_seed()
-            repeat_dataset = dataset_ctor(**{**kwargs, 'data_dir': data_dir})
-            datasets.append(repeat_dataset)
-
-        super().__init__(datasets)
 
 
 class PlainMorphoMNIST(MorphoMNIST):

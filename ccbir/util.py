@@ -1,6 +1,6 @@
 from functools import partial
 from pathlib import Path
-from typing import Callable, Dict, Hashable, Iterable, Literal, Optional, Sequence, TypeVar
+from typing import Callable, Dict, Hashable, Iterable, Literal, Optional, Sequence, TypeVar, Union
 from torch import Tensor
 from toolz import curry, valmap
 import toolz.curried as C
@@ -53,7 +53,7 @@ def _leaves_map(func, obj):
 
 
 @curry
-def leaves_map(func: Callable, d: Dict, strict=True):
+def leaves_map(func: Callable, d: Dict, strict=True) -> Dict:
     """Given a possbly-nested dictionary d, returns a new dictionary obtained by
     applying func to all the non-dictionary objects that appear in the values of
     any dictionary reachable form d, including d.
@@ -152,3 +152,26 @@ def reset_random_seed(seed=None):
         torch.seed()
     else:
         torch.manual_seed(seed)
+
+
+def numpy_ncycles(a: np.ndarray, n: int) -> np.ndarray:
+    constant_dims = [1] * (a.ndim - 1)
+    return np.tile(a, (n, *constant_dims))
+
+
+def tensor_ncycles(t: Tensor, n: int) -> Tensor:
+    constant_dims = [1] * (t.dim() - 1)
+    return t.repeat(n, *constant_dims)
+
+
+A = TypeVar('A', bound=Union[np.ndarray, Tensor])
+
+
+@curry
+def array_like_ncycles(array_like: A, n: int) -> A:
+    if isinstance(array_like, Tensor):
+        return tensor_ncycles(array_like, n)
+    elif isinstance(array_like, np.ndarray):
+        return numpy_ncycles(array_like, n)
+    else:
+        raise TypeError(f"Unsupported type {type(array_like)}")
