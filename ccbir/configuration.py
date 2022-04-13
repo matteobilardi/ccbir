@@ -1,6 +1,7 @@
 from pathlib import Path
 import shutil
 import sys
+import os
 import pytorch_lightning as pl
 from typing import Type
 
@@ -84,6 +85,8 @@ class Config:
             self._submodules_path / 'deepscm',
         ]
         sys.path.extend(map(str, paths))
+        os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+        os.environ['LD_LIBRARY_PATH'] = '/vol/cuda/11.4.120-cudnn8.2.4/lib64'
 
 
 config = Config()

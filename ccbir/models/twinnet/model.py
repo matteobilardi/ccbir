@@ -1,4 +1,10 @@
 
+from base64 import encode
+import pyro
+import pyro.optim
+import pyro.infer
+from pyro.distributions import Normal
+from ccbir.data.util import BatchDictLike
 from ccbir.pytorch_vqvae.modules import ResBlock
 from ccbir.models.twinnet.data import PSFTwinNetDataset
 from ccbir.util import ActivationFunc, activation_layer_ctor
@@ -7,6 +13,7 @@ from torch import Tensor, nn
 from typing import Callable, Literal, Tuple
 import torch
 import torch.nn.functional as F
+from toolz import dissoc
 
 
 class DeepTwinNetComponent(nn.Module):
@@ -31,7 +38,7 @@ class DeepTwinNetComponent(nn.Module):
         self.weight_sharing = weight_sharing
 
         if noise_inject_mode == 'concat':
-            self.input_dim = self.data_dim * 2
+            self.input_dim = self.data_dim + outcome_noise_dim
             self.inject_noise = (
                 lambda data, noise: torch.cat((data, noise), dim=-1)
             )
@@ -69,69 +76,33 @@ class DeepTwinNetComponent(nn.Module):
         # reparametrize_noise_net. For pure convenience, currently this is the
         # case even when we inject noise by concatenation
         self.reparametrize_noise_net = nn.Sequential(
-            linear_layer(self.data_dim),
+            linear_layer(512),
             activation(),
-            linear_layer(self.data_dim),
-            # activation(),
-            # linear_layer(self.data_dim),
+            linear_layer(outcome_noise_dim),
         )
 
-        # NOTE: so far best architecture: obtained  MSE ~0.075, without
-        # weight sharing, beating previous best (version 75)
-        def make_branch_():
-            return nn.Sequential(
-                linear_layer(1024),
-                activation(),
-                linear_layer(1024),
-                activation(),
-                linear_layer(1024),
-                activation(),
-                linear_layer(256),
-                activation(),
-                linear_layer(128),
-                nn.Unflatten(1, outcome_shape)
-            )
-
-        def make_branch_():
-            # around 0.25 loss
-            return nn.Sequential(
-                nn.Unflatten(1, (-1, 1, 1)),
-                nn.LazyConvTranspose2d(128, 3),
-                nn.LazyBatchNorm2d(),
-                activation(),
-                nn.LazyConvTranspose2d(128, 3),
-                nn.LazyBatchNorm2d(),
-                activation(),
-                nn.LazyConvTranspose2d(128, 3),
-                nn.LazyBatchNorm2d(),
-                activation(),
-                nn.LazyConvTranspose2d(128, 3),
-                ResBlock(128, activation),
-                ResBlock(128, activation),
-                ResBlock(128, activation),
-                nn.LazyConv2d(2, 2),
-            )
-
+        D = 32  # 64  # base dim
         # best so far ~ 0.035 loss on training set
+
         def make_branch():
             return nn.Sequential(
                 nn.Unflatten(1, (-1, 1, 1)),
-                nn.LazyConvTranspose2d(1024, 3),
+                nn.LazyConvTranspose2d(16 * D, 3),
                 nn.LazyBatchNorm2d(),
                 activation(),
-                nn.LazyConvTranspose2d(512, 3),
+                nn.LazyConvTranspose2d(8 * D, 3),
                 nn.LazyBatchNorm2d(),
                 activation(),
-                nn.LazyConvTranspose2d(256, 3),
+                nn.LazyConvTranspose2d(4 * D, 3),
                 nn.LazyBatchNorm2d(),
                 activation(),
-                nn.LazyConvTranspose2d(128, 3),
+                nn.LazyConvTranspose2d(2 * D, 3),
                 nn.LazyBatchNorm2d(),
                 activation(),
-                ResBlock(128, activation),
-                ResBlock(128, activation),
-                nn.LazyConv2d(64, 1),
-                ResBlock(64, activation),
+                ResBlock(2 * D, activation),
+                ResBlock(2 * D, activation),
+                nn.LazyConv2d(D, 1),
+                ResBlock(D, activation),
                 nn.LazyConv2d(2, 2),
             )
 
@@ -153,7 +124,7 @@ class DeepTwinNetComponent(nn.Module):
         )
 
         assert dummy_X_Z_output.shape[1] == self.data_dim
-        assert dummy_noise_output.shape[1] == self.data_dim
+        assert dummy_noise_output.shape[1] == outcome_noise_dim
         assert dummy_output_fact.shape[1:] == outcome_shape
         assert dummy_output_counterfact.shape[1:] == outcome_shape
 
@@ -201,6 +172,150 @@ class DeepTwinNetComponent(nn.Module):
         return factual_outcome, counterfactual_outcome
 
 
+class DeepTwinNetNoiseEncoder(nn.Module):
+    def __init__(
+        self,
+        treatment_dim: int,
+        confounders_dim: int,
+        outcome_noise_dim: int,
+        outcome_shape: torch.Size,
+        activation: Callable[..., nn.Module],
+        weight_sharing: bool,
+    ):
+        super().__init__()
+        self.treatment_dim = treatment_dim
+        self.confounders_dim = confounders_dim
+        self.outcome_noise_dim = outcome_noise_dim
+        self.outcome_shape = outcome_shape
+        self.activation = activation
+        self.weight_sharing = weight_sharing
+
+        YD = outcome_shape.numel()
+        YC = outcome_shape[0]  # channels outcome
+
+        # NOTE: for now this doesn't reduce the overall dimensions,
+        # but just flattens the outcome space to a vector
+        def outcome_encoder():
+            return nn.Sequential(
+                nn.LazyConv2d(YD, 3, 1),
+                nn.LazyBatchNorm2d(),
+                activation(),
+                nn.LazyConv2d(4 * YD, 3, 1),
+                nn.LazyBatchNorm2d(),
+                activation(),
+                nn.LazyConv2d(4 * YD, 2, 1),
+                nn.LazyBatchNorm2d(),
+                activation(),
+                nn.LazyConv2d(2 * YD, 2, 1),
+                nn.LazyBatchNorm2d(),
+                activation(),
+                nn.LazyConv2d(YD, 2, 1),
+                nn.Flatten(),
+            )
+
+        ND = outcome_noise_dim
+        NW = 16  # (stands for noise width) scales architecture easily
+
+        def noise_encoder():
+            return nn.Sequential(
+                nn.LazyLinear(512),
+                nn.LazyBatchNorm1d(),
+                activation(),
+                nn.LazyLinear(2 * NW * ND),
+                nn.LazyBatchNorm1d(),
+                activation(),
+                nn.LazyLinear(2 * ND),
+            )
+
+        self.encode_y = outcome_encoder()
+        self.encode_y_star = (
+            self.encode_y if weight_sharing else outcome_encoder()
+        )
+        self.predict_u_y = noise_encoder()
+
+        # init lazy modules
+        dummy_batch_size = 64
+        x = torch.randn(dummy_batch_size, treatment_dim)
+        x_star = x.clone()
+        z = torch.randn(dummy_batch_size, confounders_dim)
+        y = torch.randn(dummy_batch_size, *outcome_shape)
+        y_star = y.clone()
+
+        dummy_u_y_loc, dummy_u_y_scale = self.forward(
+            factual_treatment=x,
+            counterfactual_treatment=x_star,
+            confounders=z,
+            factual_outcome=y,
+            counterfactual_outcome=y_star,
+        )
+
+        assert dummy_u_y_loc.shape == (dummy_batch_size, outcome_noise_dim)
+        assert dummy_u_y_scale.shape == (dummy_batch_size, outcome_noise_dim)
+
+    def forward(
+        self,
+        factual_treatment: Tensor,
+        counterfactual_treatment: Tensor,
+        confounders: Tensor,
+        factual_outcome: Tensor,
+        counterfactual_outcome: Tensor,
+    ) -> Tensor:
+        y_enc = self.encode_y(factual_outcome)
+        y_star_enc = self.encode_y_star(counterfactual_outcome)
+
+        inputs = torch.cat((
+            factual_treatment,
+            counterfactual_treatment,
+            confounders,
+            y_enc,
+            y_star_enc,
+        ), dim=-1)
+
+        u_y_loc, log_u_y_scale = (
+            torch.chunk(self.predict_u_y(inputs), 2, dim=-1)
+        )
+        u_y_scale = torch.exp(log_u_y_scale)
+
+        return u_y_loc, u_y_scale
+
+    def forward(
+        self,
+        factual_treatment: Tensor,
+        counterfactual_treatment: Tensor,
+        confounders: Tensor,
+        factual_outcome: Tensor,
+        counterfactual_outcome: Tensor,
+    ) -> Tensor:
+        y_enc = self.encode_y(factual_outcome)
+        y_star_enc = self.encode_y_star(counterfactual_outcome)
+
+        inputs = torch.cat((
+            factual_treatment,
+            counterfactual_treatment,
+            confounders,
+            y_enc,
+            y_star_enc,
+        ), dim=-1)
+
+        u_y_loc, log_u_y_scale = (
+            torch.chunk(self.predict_u_y(inputs), 2, dim=-1)
+        )
+        u_y_scale = torch.exp(log_u_y_scale)
+
+        return u_y_loc, u_y_scale
+
+
+class V:
+    # TODO: there must be a better way to refer to random variables in pyro
+    # but alas it's strings for now...
+    factual_treatment: str = 'factual_treatment'
+    counterfactual_treatment: str = 'counterfactual_treatment'
+    confounders: str = 'confounders'
+    factual_outcome: str = 'factual_outcome'
+    counterfactual_outcome: str = 'counterfactual_outcome'
+    outcome_noise: str = 'outcome_noise'
+
+
 class TwinNet(pl.LightningModule):
     def __init__(
         self,
@@ -209,6 +324,7 @@ class TwinNet(pl.LightningModule):
         outcome_noise_dim: int,
         outcome_size: torch.Size,
         lr: float,
+        encoder_lr: float,
         noise_inject_mode: Literal['concat', 'add', 'multiply'] = 'concat',
         use_combine_net: bool = True,
         weight_sharing: bool = True,
@@ -216,6 +332,7 @@ class TwinNet(pl.LightningModule):
         batch_norm: bool = False,
     ):
         super().__init__()
+        # TODO: may want to refactor verbose argument passing
         self.twin_net = DeepTwinNetComponent(
             treatment_dim=treatment_dim,
             confounders_dim=confounders_dim,
@@ -227,54 +344,165 @@ class TwinNet(pl.LightningModule):
             activation=activation_layer_ctor(activation),
             batch_norm=batch_norm,
         )
+        self.infer_noise_net = DeepTwinNetNoiseEncoder(
+            treatment_dim=treatment_dim,
+            confounders_dim=confounders_dim,
+            outcome_noise_dim=outcome_noise_dim,
+            outcome_shape=outcome_size,
+            activation=activation_layer_ctor(activation),
+            weight_sharing=True,
+        )
         self.outcome_noise_dim = outcome_noise_dim
         self.lr = lr
+        self.encoder_lr = encoder_lr
         self.save_hyperparameters()
+
+        def optimizer_kwargs_for_model_param(module_name, param_name):
+            if module_name == 'twin_net':
+                return dict(lr=lr)
+            elif module_name == 'infer_noise_net':
+                return dict(lr=encoder_lr)
+            else:
+                raise RuntimeError(
+                    f'Unexpected parameter {module_name=}, {param_name=}')
+
+        self.svi = pyro.infer.SVI(
+            model=self.model,
+            guide=self.guide,
+            optim=pyro.optim.Adam(optimizer_kwargs_for_model_param),
+            loss=pyro.infer.TraceMeanField_ELBO(
+                num_particles=4,
+                # NOTE: I'm not sure it's possible/easy to vectorize particles
+                # when convolutions are being used as a dimension
+                # gets added to the sampled variables
+                vectorize_particles=False,
+            ),  # analytical KL ELBO
+        )
 
     def forward(self, x) -> Tuple[Tensor, Tensor]:
         return self.twin_net(**x)
 
-    def _step(self, batch):
-        X, y = batch
-
-        factual_outcome_hat, counterfactual_outcome_hat = self(X)
-
-        factual_outcome = y['factual_outcome']
-        counterfactual_outcome = y['counterfactual_outcome']
-
-        factual_loss = F.mse_loss(factual_outcome_hat, factual_outcome)
-        counterfactual_loss = F.mse_loss(
-            counterfactual_outcome_hat,
-            counterfactual_outcome,
+    def _decoder_sigma(
+        self,
+        input_batch: Tensor,
+        target_batch: Tensor,
+    ) -> Tensor:
+        assert input_batch.shape == target_batch.shape
+        # based on https://orybkin.github.io/sigma-vae/
+        # note that variance is calculated across all datapoints in the batch
+        # as is done in the sigma-vae paper
+        return (
+            ((input_batch - target_batch) ** 2)
+            .mean(dim=[0, 1, 2, 3], keepdim=True)
+            .sqrt()
+            .expand_as(input_batch)
         )
 
-        loss = factual_loss + counterfactual_loss
+    def model(self, batch):
+        pyro.module('twin_net', self.twin_net)
+        input, output = batch
+        batch_size = input[V.factual_treatment].shape[0]
 
-        # FIXME: this helps pytorch-lighnting with ambiguos batch sizes
+        y: Tensor = output[V.factual_outcome]
+        y_star: Tensor = output[V.counterfactual_outcome]
+        u_y_loc = torch.zeros(self.outcome_noise_dim, device=self.device)
+        u_y_scale = torch.ones(self.outcome_noise_dim, device=self.device)
+
+        with pyro.plate('data', size=batch_size):
+            u_y_dist = Normal(u_y_loc, u_y_scale).to_event(1)
+
+            u_y = pyro.sample(V.outcome_noise, u_y_dist)
+
+            input = {**input, V.outcome_noise: u_y}
+            y_, y_star_ = self.forward(input)
+
+            y_event_dim = y_.dim() - 1
+            assert y_event_dim == y_star_.dim() - 1
+
+            y_dist = Normal(
+                loc=y_,
+                scale=self._decoder_sigma(y_, y),
+            ).to_event(y_event_dim)
+
+            y_star_dist = Normal(
+                loc=y_star_,
+                scale=self._decoder_sigma(y_star_, y_star),
+            ).to_event(y_event_dim)
+
+            pyro.sample(V.factual_outcome, y_dist, obs=y)
+            pyro.sample(V.counterfactual_outcome, y_star_dist, obs=y_star)
+
+    def guide(self, batch):
+        pyro.module('infer_noise_net', self.infer_noise_net)
+        input, output = batch
+        batch_size = input[V.factual_treatment].shape[0]
+
+        # make sure that the inference network doesn't see the outcome noise
+        assert V.outcome_noise not in input
+
+        u_y_loc_, u_y_scale_ = self.infer_noise_net.forward(
+            factual_treatment=input[V.factual_treatment],
+            counterfactual_treatment=input[V.counterfactual_treatment],
+            confounders=input[V.confounders],
+            factual_outcome=output[V.factual_outcome],
+            counterfactual_outcome=output[V.counterfactual_outcome],
+        )
+
+        with pyro.plate('data', size=batch_size):
+            u_y_dist = Normal(u_y_loc_, u_y_scale_).to_event(1)
+            pyro.sample(V.outcome_noise, u_y_dist)
+
+    def backward(self, *args, **kwargs):
+        # no loss to backpropagate as pyro handles optimisation
+        pass
+
+    def _step(
+        self,
+        batch: Tuple[BatchDictLike, BatchDictLike],
+        *,
+        train: bool,
+    ):
+        x, y = batch
+
+        # FIXME: for now just ignoring dataset injected noise this should
+        # probably not appear in the dataset from the start
+        x = dissoc(x, V.outcome_noise)
+        batch = (x, y)
+
+        # NOTE: this helps pytorch-lighnting with ambiguos batch sizes
         # but is otherwise unnecessary
-        batch_size = y['factual_outcome'].shape[0]
+        batch_size = y[V.factual_outcome].shape[0]
         self.log('batch_size_fix', -1.0, batch_size=batch_size)
+
+        if train:
+            loss = self.svi.step(batch)
+        else:
+            loss = self.svi.evaluate_loss(batch)
+
+        loss = torch.as_tensor(loss / batch_size)
+        # TODO: kl divergence and better metrics
+        #model_no_noise = pyro.poutine.block(self.model, hide=[V.outcome_noise])
+        #kl = model_no_noise.evaluate_loss()
 
         return loss, dict(
             loss=loss,
-            factual_loss=factual_loss.item(),
-            counterfactual_loss=counterfactual_loss.item(),
         )
 
     def training_step(self, batch, _batch_idx):
-        loss, _metrics = self._step(batch)
+        loss, _metrics = self._step(batch, train=True)
         self.log('train_loss', loss.item(), on_step=True, on_epoch=True)
         return loss
 
     def validation_step(self, batch, _batch_idx):
-        _loss, metrics = self._step(batch)
+        _loss, metrics = self._step(batch, train=False)
         self.log_dict({f"val_{k}": v for k, v in metrics.items()})
 
     def test_step(self, batch, batch_idx):
         return self.validation_step(batch, batch_idx)
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.twin_net.parameters(), lr=self.lr)
+        # optimisation handled in pyro
+        pass
 
 
 class PSFTwinNet(TwinNet):
@@ -284,13 +512,16 @@ class PSFTwinNet(TwinNet):
         # 4.952220800885215e-08
         # 0.0005,  # 1.7013748158991985e-06 # 4.4157044735331275e-05
         # 0.001  # 4.952220800885215e-08  # 0.0005  # 0.0005  # 1.7013748158991985e-06
-        lr: float = 0.001
+        lr: float = 0.0005,  # 0.0005, # try with 0.0001 next
+        encoder_lr: float = 0.0001,
     ):
         super().__init__(
             outcome_size=outcome_size,
             treatment_dim=PSFTwinNetDataset.treatment_dim(),
             confounders_dim=PSFTwinNetDataset.confounders_dim(),
-            outcome_noise_dim=PSFTwinNetDataset.outcome_noise_dim,
+            # FIXME: change dataset
+            outcome_noise_dim=64,  # PSFTwinNetDataset.outcome_noise_dim,
             lr=lr,
+            encoder_lr=encoder_lr,
         )
         self.save_hyperparameters()

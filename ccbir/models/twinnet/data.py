@@ -22,17 +22,16 @@ class PSFTwinNetDataset(Dataset):
 
     metrics = ['area', 'length', 'thickness', 'slant', 'width', 'height']
     labels = list(range(10))
-    outcome_noise_dim: int = 32
 
     def __init__(
         self,
         *,
         embed_image: Callable[[Tensor], Tensor],
         train: bool,
-        repeats: int = 1,
+        repeats: int = 2,
         transform: Callable[[BatchDict], BatchDict] = None,
         normalize_metrics: bool = True,
-        normalize_perturbation_data: bool = True,
+        normalize_perturbation_data: bool = False,
         shared_cache: Optional[diskcache.Index] = None,
     ):
         super().__init__()
@@ -60,7 +59,7 @@ class PSFTwinNetDataset(Dataset):
         # are kept as attributes for ease of debugging
         # the outcome noise should be the same once the dataset is
         # generated (we don't want to resample during training)
-        self.psf_items, self.outcome_noise, self.items = dataset
+        self.psf_items, self.items = dataset
 
     def get_items(self) -> BatchDict:
         return self.items
@@ -113,10 +112,6 @@ class PSFTwinNetDataset(Dataset):
 
         psf_items_d = psf_items.dict()
 
-        outcome_noise = self.sample_outcome_noise(
-            sample_shape=(len(psf_items), self.outcome_noise_dim),
-        )
-
         swelling_data = psf_items_d['swollen']['perturbation_data']
         fracture_data = psf_items_d['fractured']['perturbation_data']
 
@@ -130,7 +125,6 @@ class PSFTwinNetDataset(Dataset):
             factual_treatment=swelling,
             counterfactual_treatment=fracture,
             confounders=label_and_metrics,
-            outcome_noise=outcome_noise,
         )
 
         swollen_z = self.embed_image(psf_items_d['swollen']['image'])
@@ -142,7 +136,7 @@ class PSFTwinNetDataset(Dataset):
         )
 
         items = BatchDict(dict(x=x, y=y))
-        dataset = psf_items, outcome_noise, items
+        dataset = psf_items, items
 
         return dataset
 
@@ -154,19 +148,6 @@ class PSFTwinNetDataset(Dataset):
     @classmethod
     def confounders_dim(cls) -> int:
         return len(cls.labels) + len(cls.metrics)
-
-    @classmethod
-    def sample_outcome_noise(
-        cls,
-        sample_shape: torch.Size,
-        scale: float = 0.25,
-    ) -> Tensor:
-        # TODO: consider moving to DataModule
-        # NOTE: this should be exact comparison despite float
-        if scale == 0:
-            return torch.ones(sample_shape)
-        else:
-            return (Normal(0, scale).sample(sample_shape) % 1) + 1
 
     @classmethod
     def pert_type_to_index(cls, pert_type: str) -> int:
@@ -286,7 +267,7 @@ class PSFTwinNetDataModule(MorphoMNISTDataModule):
         self,
         *,
         embed_image: Callable[[Tensor], Tensor],
-        batch_size: int = 64,
+        batch_size: int = 256,
         pin_memory: bool = True,
         **kwargs,
     ):

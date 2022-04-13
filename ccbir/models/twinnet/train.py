@@ -1,4 +1,5 @@
 from ccbir.configuration import config
+config.pythonpath_fix()
 from ccbir.models.twinnet.data import PSFTwinNetDataModule
 from ccbir.models.twinnet.model import PSFTwinNet
 from ccbir.models.util import load_best_model
@@ -10,7 +11,6 @@ from pytorch_lightning.utilities.cli import LightningCLI
 from torch import Tensor
 import torch
 import torch.multiprocessing
-import shutil
 
 
 def vqvae_embed_image(vqvae: VQVAE, image: Tensor):
