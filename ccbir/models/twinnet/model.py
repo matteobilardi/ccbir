@@ -1,5 +1,6 @@
 
 from base64 import encode
+from numpy import var
 import pyro
 import pyro.optim
 import pyro.infer
@@ -10,10 +11,10 @@ from ccbir.models.twinnet.data import PSFTwinNetDataset
 from ccbir.util import ActivationFunc, activation_layer_ctor
 import pytorch_lightning as pl
 from torch import Tensor, nn
-from typing import Callable, Literal, Tuple
+from typing import Callable, Dict, Literal, Tuple
 import torch
 import torch.nn.functional as F
-from toolz import dissoc
+from toolz import dissoc, keymap
 
 
 class DeepTwinNetComponent(nn.Module):
@@ -316,6 +317,54 @@ class V:
     outcome_noise: str = 'outcome_noise'
 
 
+class CustomELBO(pyro.infer.TraceMeanField_ELBO):
+    # inspired by deepscm codebase
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.trace_storage = {'model': None, 'guide': None}
+
+    def _get_trace(self, model, guide, args, kwargs):
+        model_trace, guide_trace = (
+            super()._get_trace(model, guide, args, kwargs)
+        )
+
+        self.trace_storage['model'] = model_trace
+        self.trace_storage['guide'] = guide_trace
+
+        return model_trace, guide_trace
+
+    def get_metrics(self) -> Dict:
+        model = self.trace_storage['model']
+        guide = self.trace_storage['guide']
+
+        def log_prob(model_or_guide, variable) -> float:
+            log_prob = model_or_guide.nodes[variable]['log_prob'].mean()
+            return log_prob.item()
+
+        model_random_vars = [
+            V.factual_outcome,
+            V.counterfactual_outcome,
+            V.outcome_noise,
+        ]
+        guide_random_vars = [V.outcome_noise]
+
+        model_probs = {v: log_prob(model, v) for v in model_random_vars}
+        guide_probs = {v: log_prob(guide, v) for v in guide_random_vars}
+        kl = guide_probs[V.outcome_noise] - model_probs[V.outcome_noise]
+
+        model_metrics = keymap(lambda v: f"log p({v})", model_probs)
+        guide_metrics = keymap(lambda v: f"log q({v})", guide_probs)
+
+        return {
+            **model_metrics,
+            **guide_metrics,
+            # TODO: not completely sure this is what I'm extracting from pyro
+            f"KL(q({V.outcome_noise}|everything)||p({V.outcome_noise}))": kl,
+        }
+
+
 class TwinNet(pl.LightningModule):
     def __init__(
         self,
@@ -366,17 +415,19 @@ class TwinNet(pl.LightningModule):
                 raise RuntimeError(
                     f'Unexpected parameter {module_name=}, {param_name=}')
 
+        # analytical KL ELBO
+        self.svi_loss = CustomELBO(
+            num_particles=1,
+            # NOTE: I'm not sure it's possible/easy to vectorize particles
+            # when convolutions are being used as a dimension
+            # gets added to the sampled variables
+            vectorize_particles=False,
+        )
         self.svi = pyro.infer.SVI(
             model=self.model,
             guide=self.guide,
             optim=pyro.optim.Adam(optimizer_kwargs_for_model_param),
-            loss=pyro.infer.TraceMeanField_ELBO(
-                num_particles=4,
-                # NOTE: I'm not sure it's possible/easy to vectorize particles
-                # when convolutions are being used as a dimension
-                # gets added to the sampled variables
-                vectorize_particles=False,
-            ),  # analytical KL ELBO
+            loss=self.svi_loss
         )
 
     def forward(self, x) -> Tuple[Tensor, Tensor]:
@@ -384,18 +435,18 @@ class TwinNet(pl.LightningModule):
 
     def _decoder_sigma(
         self,
-        input_batch: Tensor,
+        estimate_batch: Tensor,
         target_batch: Tensor,
     ) -> Tensor:
-        assert input_batch.shape == target_batch.shape
+        assert estimate_batch.shape == target_batch.shape
         # based on https://orybkin.github.io/sigma-vae/
         # note that variance is calculated across all datapoints in the batch
         # as is done in the sigma-vae paper
         return (
-            ((input_batch - target_batch) ** 2)
+            ((estimate_batch - target_batch) ** 2)
             .mean(dim=[0, 1, 2, 3], keepdim=True)
             .sqrt()
-            .expand_as(input_batch)
+            .expand_as(estimate_batch)
         )
 
     def model(self, batch):
@@ -410,7 +461,6 @@ class TwinNet(pl.LightningModule):
 
         with pyro.plate('data', size=batch_size):
             u_y_dist = Normal(u_y_loc, u_y_scale).to_event(1)
-
             u_y = pyro.sample(V.outcome_noise, u_y_dist)
 
             input = {**input, V.outcome_noise: u_y}
@@ -480,25 +530,28 @@ class TwinNet(pl.LightningModule):
             loss = self.svi.evaluate_loss(batch)
 
         loss = torch.as_tensor(loss / batch_size)
-        # TODO: kl divergence and better metrics
-        #model_no_noise = pyro.poutine.block(self.model, hide=[V.outcome_noise])
-        #kl = model_no_noise.evaluate_loss()
+        svi_metrics = self.svi_loss.get_metrics()
 
         return loss, dict(
             loss=loss,
+            **svi_metrics,
         )
 
     def training_step(self, batch, _batch_idx):
-        loss, _metrics = self._step(batch, train=True)
-        self.log('train_loss', loss.item(), on_step=True, on_epoch=True)
+        loss, metrics = self._step(batch, train=True)
+        train_metrics = keymap('train/'.__add__, metrics)
+        self.log_dict(train_metrics)
         return loss
 
     def validation_step(self, batch, _batch_idx):
         _loss, metrics = self._step(batch, train=False)
-        self.log_dict({f"val_{k}": v for k, v in metrics.items()})
+        val_metrics = keymap('val/'.__add__, metrics)
+        self.log_dict(val_metrics, on_epoch=True)
 
     def test_step(self, batch, batch_idx):
-        return self.validation_step(batch, batch_idx)
+        _loss, metrics = self._step(batch, train=False)
+        test_metrics = keymap('test/'.__add__, metrics)
+        self.log_dict(test_metrics, on_epoch=True)
 
     def configure_optimizers(self):
         # optimisation handled in pyro

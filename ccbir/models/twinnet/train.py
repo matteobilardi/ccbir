@@ -1,16 +1,17 @@
+import torch.multiprocessing
+import torch
+from torch import Tensor
+from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.utilities.cli import LightningCLI
+from pytorch_lightning.callbacks import ModelCheckpoint
+from functools import partial
+from ccbir.util import maybe_unbatched_apply, tune_lr
+from ccbir.models.vqvae.model import VQVAE
+from ccbir.models.util import load_best_model
+from ccbir.models.twinnet.model import PSFTwinNet
+from ccbir.models.twinnet.data import PSFTwinNetDataModule
 from ccbir.configuration import config
 config.pythonpath_fix()
-from ccbir.models.twinnet.data import PSFTwinNetDataModule
-from ccbir.models.twinnet.model import PSFTwinNet
-from ccbir.models.util import load_best_model
-from ccbir.models.vqvae.model import VQVAE
-from ccbir.util import maybe_unbatched_apply, tune_lr
-from functools import partial
-from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.utilities.cli import LightningCLI
-from torch import Tensor
-import torch
-import torch.multiprocessing
 
 
 def vqvae_embed_image(vqvae: VQVAE, image: Tensor):
@@ -28,8 +29,6 @@ def main():
     # clean up possible database caches from interrupted previous run
     # config.clear_temporary_data()
 
-    # FIXME: initialsiation, traning, saving and storing a bit hacky currently
-    # Functions signatures needed by LightningCLI so can't use functools.partial
     def Model() -> PSFTwinNet:
         return PSFTwinNet(outcome_size=embedding_size)
 
@@ -44,15 +43,19 @@ def main():
         save_config_overwrite=True,
         run=False,  # deactivate automatic fitting
         trainer_defaults=dict(
+            logger=TensorBoardLogger(
+                save_dir=str(config.tensorboard_logs_path),
+                name='twinnet',
+            ),
             callbacks=[
                 ModelCheckpoint(
-                    monitor='val_loss',
+                    monitor='val/loss',
                     filename='twinnet-{epoch:03d}-{val_loss:.7f}',
                     save_top_k=3,
                     save_last=True,
                 ),
                 ModelCheckpoint(
-                    monitor='train_loss',
+                    monitor='train/loss',
                     filename='twinnet-{epoch:03d}-{train_loss:.7f}',
                     save_top_k=3,
                     save_last=False,
