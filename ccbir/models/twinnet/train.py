@@ -1,3 +1,5 @@
+from ccbir.configuration import config
+config.pythonpath_fix()
 import torch.multiprocessing
 import torch
 from torch import Tensor
@@ -10,8 +12,6 @@ from ccbir.models.vqvae.model import VQVAE
 from ccbir.models.util import load_best_model
 from ccbir.models.twinnet.model import PSFTwinNet
 from ccbir.models.twinnet.data import PSFTwinNetDataModule
-from ccbir.configuration import config
-config.pythonpath_fix()
 
 
 def vqvae_embed_image(vqvae: VQVAE, image: Tensor):
@@ -62,7 +62,7 @@ def main():
                     save_on_train_epoch_end=True,
                 ),
             ],
-            max_epochs=3000,
+            max_epochs=5000,
             gpus=1,
             # profiler='simple',
         ),

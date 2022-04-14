@@ -1,6 +1,5 @@
 
-from base64 import encode
-from numpy import var
+from enum import Enum
 import pyro
 import pyro.optim
 import pyro.infer
@@ -80,7 +79,7 @@ class DeepTwinNetComponent(nn.Module):
             linear_layer(outcome_noise_dim),
         )
 
-        D = 8  # 64  # base dim
+        D = 64  # 8  # 64  # base dim
         # best so far ~ 0.035 loss on training set
 
         def make_branch():
@@ -98,9 +97,10 @@ class DeepTwinNetComponent(nn.Module):
                 nn.LazyConvTranspose2d(2 * D, 3),
                 nn.LazyBatchNorm2d(),
                 activation(),
+                ResBlock(2 * D, activation),
+                ResBlock(2 * D, activation),
                 nn.LazyConv2d(D, 1),
-                nn.LazyBatchNorm2d(),
-                activation(),
+                ResBlock(D, activation),
                 nn.LazyConv2d(2, 2),
             )
 
@@ -189,13 +189,16 @@ class DeepTwinNetNoiseEncoder(nn.Module):
         # but just flattens the outcome space to a vector
         def outcome_encoder():
             return nn.Sequential(
-                nn.LazyConv2d(YD // 8, 3, 1),
+                nn.LazyConv2d(YD, 3, 1),
                 nn.LazyBatchNorm2d(),
                 activation(),
-                nn.LazyConv2d(YD // 4, 3, 1),
+                nn.LazyConv2d(4 * YD, 3, 1),
                 nn.LazyBatchNorm2d(),
                 activation(),
-                nn.LazyConv2d(YD // 2, 3, 1),
+                nn.LazyConv2d(4 * YD, 2, 1),
+                nn.LazyBatchNorm2d(),
+                activation(),
+                nn.LazyConv2d(2 * YD, 2, 1),
                 nn.LazyBatchNorm2d(),
                 activation(),
                 nn.LazyConv2d(YD, 2, 1),
@@ -203,15 +206,15 @@ class DeepTwinNetNoiseEncoder(nn.Module):
             )
 
         ND = outcome_noise_dim
-        NW = 16  # 16  # (stands for noise width) scales architecture easily
+        NW = 16  # (stands for noise width) scales architecture easily
 
         def noise_encoder():
             return nn.Sequential(
                 nn.LazyLinear(512),
-                # nn.LazyBatchNorm1d(),
+                nn.LazyBatchNorm1d(),
                 activation(),
                 nn.LazyLinear(2 * NW * ND),
-                # nn.LazyBatchNorm1d(),
+                nn.LazyBatchNorm1d(),
                 activation(),
                 nn.LazyLinear(2 * ND),
             )
@@ -327,6 +330,108 @@ class CustomELBO(pyro.infer.TraceMeanField_ELBO):
         }
 
 
+def compute_optimal_sigma(
+    estimate_batch: Tensor,
+    target_batch: Tensor,
+) -> Tensor:
+    assert estimate_batch.shape == target_batch.shape
+    # based on https://orybkin.github.io/sigma-vae/
+    # note that variance is calculated across all datapoints in the batch
+    # as is done in the sigma-vae paper
+    return (
+        ((estimate_batch - target_batch) ** 2)
+        .mean(dim=[0, 1, 2, 3], keepdim=True)
+        .sqrt()
+        .expand_as(estimate_batch)
+    )
+
+
+class Stage(Enum):
+    TRAIN = 'train'
+    VAL = 'val'
+    TEST = 'test'
+    PREDICT = 'predict'
+
+
+class ValidationOptimalSigma:
+    def __init__(
+        self,
+        stage: Stage,
+    ) -> None:
+        self._val_variances = []
+        self._stage = stage
+        self._val_optimal_sigma = None
+
+    def set_stage(self, stage: Stage):
+        if self._stage == stage:
+            return
+
+        if stage == Stage.TRAIN and len(self._val_variances) > 0:
+            # element-wise mean sigma of the validation sigmas
+            val_optimal_variance = torch.mean(
+                input=torch.stack(self._val_variances),
+                dim=0,
+            )
+            self._val_optimal_sigma = val_optimal_variance.sqrt()
+        elif stage == Stage.VAL:
+            self._val_optimal_sigma = None
+        else:
+            # predicting or testing
+            pass
+
+        self._val_variances.clear()
+        self._stage = stage
+
+    def _compute_optimal_variance(
+        self,
+        estimate_batch: Tensor,
+        target_batch: Tensor,
+    ) -> Tensor:
+        assert estimate_batch.shape == target_batch.shape
+        n = estimate_batch.numel()
+        unbiased_variance = (
+            ((estimate_batch - target_batch) ** 2).sum() / (n - 1)
+        )
+
+        # NOTE: this is a scalar
+        return unbiased_variance
+
+    def __call__(
+        self,
+        estimate_batch: Tensor,
+        target_batch: Tensor,
+    ) -> Tensor:
+        if self._val_optimal_sigma is None:
+            if self._stage == Stage.TRAIN:
+                # validation hasn't run yet, so just compute the optimal sigma
+                # on the training set
+                return compute_optimal_sigma(estimate_batch, target_batch)
+            elif self._stage == Stage.VAL:
+                # accumulate optimal variances during validation
+                variance = self._compute_optimal_variance(
+                    estimate_batch,
+                    target_batch,
+                )
+
+                self._val_variances.append(variance)
+                sigma = variance.sqrt().expand_as(estimate_batch)
+                return sigma
+            else:
+                # predicting or testing, don't use optimal sigma
+                return torch.ones_like(estimate_batch)
+        else:
+            if self._stage == Stage.TRAIN:
+                return self._val_optimal_sigma.expand_as(estimate_batch)
+            elif self._stage == Stage.VAL:
+                raise RuntimeError(
+                    "Unreachable code: we don't compute the optimal sigma to"
+                    "be used during training while still in validation stage"
+                )
+            else:
+                # predicting or testing, don't use optimal sigma
+                return torch.ones_like(estimate_batch)
+
+
 class TwinNet(pl.LightningModule):
     def __init__(
         self,
@@ -337,9 +442,10 @@ class TwinNet(pl.LightningModule):
         lr: float,
         encoder_lr: float,
         factual_loss_scale: float = 0.8,
+        val_optimal_sigma: bool = True,
         noise_inject_mode: Literal['concat', 'add', 'multiply'] = 'concat',
-        use_combine_net: bool = False,
-        weight_sharing: bool = True,
+        use_combine_net: bool = True,
+        weight_sharing: bool = False,
         activation: ActivationFunc = 'mish',
         batch_norm: bool = False,
     ):
@@ -362,7 +468,7 @@ class TwinNet(pl.LightningModule):
             outcome_noise_dim=outcome_noise_dim,
             outcome_shape=outcome_size,
             activation=activation_layer_ctor(activation),
-            weight_sharing=True,
+            weight_sharing=False,
         )
         self.outcome_noise_dim = outcome_noise_dim
         self.lr = lr
@@ -371,7 +477,14 @@ class TwinNet(pl.LightningModule):
         assert 0.0 < factual_loss_scale < 2.0, factual_loss_scale
         self.factual_loss_scale = factual_loss_scale
         self.counterfactual_loss_scale = 2.0 - factual_loss_scale
+        self.val_optimal_sigma = val_optimal_sigma
         self.save_hyperparameters()
+
+        self.stage = Stage.TRAIN
+        self.optimal_sigma = (
+            ValidationOptimalSigma(self.stage) if val_optimal_sigma else
+            compute_optimal_sigma
+        )
 
         def optimizer_kwargs_for_model_param(module_name, param_name):
             if module_name == 'twin_net':
@@ -400,22 +513,6 @@ class TwinNet(pl.LightningModule):
     def forward(self, x) -> Tuple[Tensor, Tensor]:
         return self.twin_net(**x)
 
-    def _decoder_optimal_sigma(
-        self,
-        estimate_batch: Tensor,
-        target_batch: Tensor,
-    ) -> Tensor:
-        assert estimate_batch.shape == target_batch.shape
-        # based on https://orybkin.github.io/sigma-vae/
-        # note that variance is calculated across all datapoints in the batch
-        # as is done in the sigma-vae paper
-        return (
-            ((estimate_batch - target_batch) ** 2)
-            .mean(dim=[0, 1, 2, 3], keepdim=True)
-            .sqrt()
-            .expand_as(estimate_batch)
-        )
-
     def model(self, batch):
         pyro.module('twin_net', self.twin_net)
         input, output = batch
@@ -436,27 +533,19 @@ class TwinNet(pl.LightningModule):
             y_event_dim = y_.dim() - 1
             assert y_event_dim == y_star_.dim() - 1
             y_loc = y_
-            y_scale = self._decoder_optimal_sigma(y_, y)
+            y_scale = self.optimal_sigma(y_, y)
             y_dist = Normal(y_loc, y_scale).to_event(y_event_dim)
 
             y_star_loc = y_star_
-            y_star_scale = self._decoder_optimal_sigma(y_star_, y_star)
+            y_star_scale = self.optimal_sigma(y_star_, y_star)
             y_star_dist = (
                 Normal(y_star_loc, y_star_scale).to_event(y_event_dim)
             )
 
-            # TODO: move to helper or training step
-            # log sigma-vae sigmas
-            y_scale_scalar: Tensor = y_scale.unique()
-            y_star_scale_scalar: Tensor = y_scale.unique()
-            assert y_scale_scalar.numel() == 1
-            assert y_star_scale_scalar.numel() == 1
-            self.log_dict({
-                f"{V.factual_outcome}_scale": y_scale_scalar[0].item(),
-                f"{V.counterfactual_outcome}_scale": (
-                    y_star_scale_scalar[0].item()
-                ),
-            })
+            self._log_optimal_sigmas(
+                factual_sigma=y_scale,
+                counterfactual_sigma=y_star_scale,
+            )
 
             with pyro.poutine.scale(scale=self.factual_loss_scale):
                 pyro.sample(V.factual_outcome, y_dist, obs=y)
@@ -486,6 +575,51 @@ class TwinNet(pl.LightningModule):
     def backward(self, *args, **kwargs):
         # no loss to backpropagate as pyro handles optimisation
         pass
+
+    def configure_optimizers(self):
+        # optimisation handled in pyro
+        pass
+
+    def set_stage(self, stage: Stage):
+        self.stage = stage
+        if isinstance(self.optimal_sigma, ValidationOptimalSigma):
+            self.optimal_sigma.set_stage(stage)
+
+    def on_train_epoch_start(self):
+        super().on_train_epoch_start()
+        self.set_stage(Stage.TRAIN)
+
+    def on_validation_epoch_start(self):
+        super().on_validation_epoch_start()
+        self.set_stage(Stage.VAL)
+
+    def on_test_epoch_start(self):
+        super().on_test_epoch_start()
+        self.set_stage(Stage.TEST)
+
+    def on_predict_epoch_start(self) -> None:
+        super().on_predict_epoch_start()
+        self.set_stage(Stage.PREDICT)
+
+    def training_step(self, batch, _batch_idx):
+        loss, metrics = self._step(batch, train=True)
+        train_metrics = keymap('train/'.__add__, metrics)
+        # needed without / to include in the checkpoint filename
+        train_metrics['train_loss'] = metrics['loss']
+        self.log_dict(train_metrics)
+        return loss
+
+    def validation_step(self, batch, _batch_idx):
+        _loss, metrics = self._step(batch, train=False)
+        val_metrics = keymap('val/'.__add__, metrics)
+        # needed without / to include in the checkpoint filename
+        val_metrics['val_loss'] = metrics['loss']
+        self.log_dict(val_metrics, on_epoch=True)
+
+    def test_step(self, batch, batch_idx):
+        _loss, metrics = self._step(batch, train=False)
+        test_metrics = keymap('test/'.__add__, metrics)
+        self.log_dict(test_metrics, on_epoch=True)
 
     def _step(
         self,
@@ -518,29 +652,22 @@ class TwinNet(pl.LightningModule):
             **svi_metrics,
         )
 
-    def training_step(self, batch, _batch_idx):
-        loss, metrics = self._step(batch, train=True)
-        train_metrics = keymap('train/'.__add__, metrics)
-        # needed without / to include in the checkpoint filename
-        train_metrics['train_loss'] = metrics['loss']
-        self.log_dict(train_metrics)
-        return loss
-
-    def validation_step(self, batch, _batch_idx):
-        _loss, metrics = self._step(batch, train=False)
-        val_metrics = keymap('val/'.__add__, metrics)
-        # needed without / to include in the checkpoint filename
-        val_metrics['val_loss'] = metrics['loss']
-        self.log_dict(val_metrics, on_epoch=True)
-
-    def test_step(self, batch, batch_idx):
-        _loss, metrics = self._step(batch, train=False)
-        test_metrics = keymap('test/'.__add__, metrics)
-        self.log_dict(test_metrics, on_epoch=True)
-
-    def configure_optimizers(self):
-        # optimisation handled in pyro
-        pass
+    def _log_optimal_sigmas(
+        self,
+        factual_sigma: Tensor,
+        counterfactual_sigma: Tensor
+    ):
+        factual_sigma_: Tensor = factual_sigma.unique()
+        counterfactual_sigma_: Tensor = counterfactual_sigma.unique()
+        assert factual_sigma_.numel() == 1
+        assert counterfactual_sigma_.numel() == 1
+        factual_sigma_scalar = factual_sigma_[0].item()
+        counterfactual_sigma_scalar = counterfactual_sigma_[0].item()
+        stage = self.stage.value
+        self.log_dict({
+            f"{stage}/factual_sigma": factual_sigma_scalar,
+            f"{stage}/counterfactual_sigma": counterfactual_sigma_scalar,
+        })
 
 
 class PSFTwinNet(TwinNet):
@@ -558,7 +685,7 @@ class PSFTwinNet(TwinNet):
             treatment_dim=PSFTwinNetDataset.treatment_dim(),
             confounders_dim=PSFTwinNetDataset.confounders_dim(),
             # FIXME: change dataset
-            outcome_noise_dim=16,  # PSFTwinNetDataset.outcome_noise_dim,
+            outcome_noise_dim=32,  # PSFTwinNetDataset.outcome_noise_dim,
             lr=lr,
             encoder_lr=encoder_lr,
         )

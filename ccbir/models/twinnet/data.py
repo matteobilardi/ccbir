@@ -267,7 +267,7 @@ class PSFTwinNetDataModule(MorphoMNISTDataModule):
         self,
         *,
         embed_image: Callable[[Tensor], Tensor],
-        batch_size: int = 256,
+        batch_size: int = 512,
         pin_memory: bool = True,
         **kwargs,
     ):
