@@ -325,7 +325,7 @@ class PerturbedMorphoMNIST(MorphoMNIST):
         original_images = original_dataset.images
         original_num_imgs = len(original_images)
 
-        # NOTE: these should be made BatchDict to support arbitrary
+        # NOTE: these could be made BatchDict to support arbitrary
         # perturbations and perturbations' args in a single dataset
         # but since we don't need that for now, just repeating the perturbation
         perturbations_type = repeat(perturbation_type, original_num_imgs)
