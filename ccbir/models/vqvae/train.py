@@ -1,5 +1,7 @@
+from ccbir.configuration import config
 from ccbir.models.vqvae.data import VQVAEMorphoMNISTDataModule
 from ccbir.models.vqvae.model import VQVAE
+from pytorch_lightning.loggers import TensorBoardLogger
 
 
 def main():
@@ -12,12 +14,13 @@ def main():
         save_config_overwrite=True,
         run=False,  # deactivate automatic fitting
         trainer_defaults=dict(
+            logger=TensorBoardLogger(
+                save_dir=str(config.tensorboard_logs_path),
+                name='vqvae',
+            ),
             callbacks=[
                 ModelCheckpoint(
                     monitor='val_loss',
-                    # dirpath=str(config.checkpoints_path_for_model(
-                    #    model_type=VQVAE
-                    # )),
                     filename='vqvae-morphomnist-{epoch:03d}-{val_loss:.7f}',
                     save_top_k=3,
                     save_last=True,

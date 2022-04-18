@@ -1,204 +1,84 @@
-
-from ccbir.pytorch_vqvae.modules import ResBlock
+from enum import Enum
+from functools import partial
+import pyro
+import pyro.optim
+import pyro.infer
+from pyro.distributions import Normal, Categorical
+from ccbir.arch import PreActResBlock
+from ccbir.models.twinnet.arch import (
+    DeepTwinNet,
+    DeepTwinNetNoiseEncoder,
+)
+from ccbir.models.util import load_best_model
+from ccbir.models.vqvae.model import VQVAE
+from ccbir.data.util import BatchDictLike
 from ccbir.models.twinnet.data import PSFTwinNetDataset
 from ccbir.util import ActivationFunc, activation_layer_ctor
 import pytorch_lightning as pl
-from torch import Tensor, nn
-from typing import Callable, Literal, Tuple
+from torch import Tensor
+from typing import Dict, Literal, Optional, Tuple
 import torch
-import torch.nn.functional as F
+from toolz import dissoc, keymap
 
 
-class DeepTwinNetComponent(nn.Module):
-    """Twin network for DAG: X -> Y <- Z that allows sampling from
-    P(Y, Y* | X, X*, Z)"""
+class V:
+    """Model variables"""
+    # TODO: there must be a better way to refer to random variables in pyro
+    # but alas it's strings for now...
+    factual_treatment: str = 'factual_treatment'
+    counterfactual_treatment: str = 'counterfactual_treatment'
+    confounders: str = 'confounders'
+    factual_outcome: str = 'factual_outcome'
+    counterfactual_outcome: str = 'counterfactual_outcome'
+    outcome_noise: str = 'outcome_noise'
 
-    def __init__(
-        self,
-        treatment_dim: int,
-        confounders_dim: int,
-        outcome_noise_dim: int,
-        outcome_shape: torch.Size,
-        noise_inject_mode: Literal['concat', 'add', 'multiply'],
-        use_combine_net: bool,
-        weight_sharing: bool,
-        activation: Callable[..., nn.Module],
-        batch_norm: bool,
-    ):
-        super().__init__()
-        self.use_combine_net = use_combine_net
-        self.data_dim = treatment_dim + confounders_dim
-        self.weight_sharing = weight_sharing
 
-        if noise_inject_mode == 'concat':
-            self.input_dim = self.data_dim * 2
-            self.inject_noise = (
-                lambda data, noise: torch.cat((data, noise), dim=-1)
-            )
-        elif noise_inject_mode == 'add':
-            self.input_dim = self.data_dim
-            self.inject_noise = torch.add
-        elif noise_inject_mode == 'multiply':
-            self.input_dim = self.data_dim
-            self.inject_noise = torch.mul
-        else:
-            raise ValueError(f"Invalid {noise_inject_mode=}")
+class CustomELBO(pyro.infer.TraceMeanField_ELBO):
+    """Analytical KL ELBO that tracks metrics about the model variables"""
+    # inspired by deepscm codebase
 
-        # TODO: For clarity consider not using lazy layers once the architecture
-        # is stabilised
-        def linear_layer(out_features: int, batch_norm: bool = batch_norm):
-            layers = []
-            layers.append(nn.LazyLinear(out_features=out_features))
-            if batch_norm:
-                layers.append(nn.LazyBatchNorm1d())
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
-            return nn.Sequential(*layers)
+        self.trace_storage = {'model': None, 'guide': None}
 
-        self.combine_treatment_confounders_net = nn.Sequential(
-            linear_layer(self.data_dim),
-            activation(),
-            linear_layer(self.data_dim),
-            # activation(),
-            # linear_layer(),
-        ) if use_combine_net else None
-
-        # to inject noise via multiplication/addition, we currently force
-        # the reparametrised noise to have the same number of dimensions as the
-        # data (i.e. [treatement, confounders]) regardless of the value of
-        # outcome_noise_dim, which is just the size of the input to the
-        # reparametrize_noise_net. For pure convenience, currently this is the
-        # case even when we inject noise by concatenation
-        self.reparametrize_noise_net = nn.Sequential(
-            linear_layer(self.data_dim),
-            activation(),
-            linear_layer(self.data_dim),
-            # activation(),
-            # linear_layer(self.data_dim),
+    def _get_trace(self, model, guide, args, kwargs):
+        model_trace, guide_trace = (
+            super()._get_trace(model, guide, args, kwargs)
         )
 
-        # NOTE: so far best architecture: obtained  MSE ~0.075, without
-        # weight sharing, beating previous best (version 75)
-        def make_branch_():
-            return nn.Sequential(
-                linear_layer(1024),
-                activation(),
-                linear_layer(1024),
-                activation(),
-                linear_layer(1024),
-                activation(),
-                linear_layer(256),
-                activation(),
-                linear_layer(128),
-                nn.Unflatten(1, outcome_shape)
-            )
+        self.trace_storage['model'] = model_trace
+        self.trace_storage['guide'] = guide_trace
 
-        def make_branch_():
-            # around 0.25 loss
-            return nn.Sequential(
-                nn.Unflatten(1, (-1, 1, 1)),
-                nn.LazyConvTranspose2d(128, 3),
-                nn.LazyBatchNorm2d(),
-                activation(),
-                nn.LazyConvTranspose2d(128, 3),
-                nn.LazyBatchNorm2d(),
-                activation(),
-                nn.LazyConvTranspose2d(128, 3),
-                nn.LazyBatchNorm2d(),
-                activation(),
-                nn.LazyConvTranspose2d(128, 3),
-                ResBlock(128, activation),
-                ResBlock(128, activation),
-                ResBlock(128, activation),
-                nn.LazyConv2d(2, 2),
-            )
+        return model_trace, guide_trace
 
-        # best so far ~ 0.035 loss on training set
-        def make_branch():
-            return nn.Sequential(
-                nn.Unflatten(1, (-1, 1, 1)),
-                nn.LazyConvTranspose2d(1024, 3),
-                nn.LazyBatchNorm2d(),
-                activation(),
-                nn.LazyConvTranspose2d(512, 3),
-                nn.LazyBatchNorm2d(),
-                activation(),
-                nn.LazyConvTranspose2d(256, 3),
-                nn.LazyBatchNorm2d(),
-                activation(),
-                nn.LazyConvTranspose2d(128, 3),
-                nn.LazyBatchNorm2d(),
-                activation(),
-                ResBlock(128, activation),
-                ResBlock(128, activation),
-                nn.LazyConv2d(64, 1),
-                ResBlock(64, activation),
-                nn.LazyConv2d(2, 2),
-            )
+    def get_metrics(self) -> Dict:
+        model = self.trace_storage['model']
+        guide = self.trace_storage['guide']
 
-        self.factual_branch = make_branch()
-        self.counterfactual_branch = (
-            self.factual_branch if weight_sharing else make_branch()
-        )
+        def log_prob(model_or_guide, variable) -> float:
+            log_prob = model_or_guide.nodes[variable]['log_prob'].mean()
+            return log_prob.item()
 
-        # force lazy init
-        dummy_X_Z_output = self.combine_treatment_confounders_net(
-            torch.rand(64, self.data_dim)
-        )
-        dummy_noise_output = self.reparametrize_noise_net(
-            torch.rand(64, outcome_noise_dim)
-        )
-        dummy_output_fact = self.factual_branch(torch.rand(64, self.input_dim))
-        dummy_output_counterfact = (
-            self.counterfactual_branch(torch.rand(64, self.input_dim))
-        )
+        model_random_vars = [
+            V.factual_outcome,
+            V.counterfactual_outcome,
+            V.outcome_noise,
+        ]
+        guide_random_vars = [V.outcome_noise]
 
-        assert dummy_X_Z_output.shape[1] == self.data_dim
-        assert dummy_noise_output.shape[1] == self.data_dim
-        assert dummy_output_fact.shape[1:] == outcome_shape
-        assert dummy_output_counterfact.shape[1:] == outcome_shape
+        model_probs = {v: log_prob(model, v) for v in model_random_vars}
+        guide_probs = {v: log_prob(guide, v) for v in guide_random_vars}
+        kl = guide_probs[V.outcome_noise] - model_probs[V.outcome_noise]
 
-    def combine_treatment_confounders(
-        self,
-        treatment: Tensor,
-        confounders: Tensor,
-    ) -> Tensor:
-        combined = torch.cat((treatment, confounders), dim=-1)
-        if self.use_combine_net:
-            combined = self.combine_treatment_confounders_net(combined)
+        model_metrics = keymap(lambda v: f"log p({v})", model_probs)
+        guide_metrics = keymap(lambda v: f"log q({v})", guide_probs)
 
-        return combined
-
-    def forward(
-        self,
-        factual_treatment: Tensor,
-        counterfactual_treatment: Tensor,
-        confounders: Tensor,
-        outcome_noise: Tensor,
-    ) -> Tuple[Tensor, Tensor]:
-
-        factual_data = self.combine_treatment_confounders(
-            factual_treatment,
-            confounders,
-        )
-
-        counterfactual_data = self.combine_treatment_confounders(
-            counterfactual_treatment,
-            confounders
-        )
-
-        noise = self.reparametrize_noise_net(outcome_noise)
-
-        factual_input = self.inject_noise(factual_data, noise)
-        counterfactual_input = self.inject_noise(counterfactual_data, noise)
-
-        # factual_branch and counterfactual_branch are the same network
-        # when weight sharing is on
-        factual_outcome = self.factual_branch(factual_input)
-        counterfactual_outcome = (
-            self.counterfactual_branch(counterfactual_input)
-        )
-
-        return factual_outcome, counterfactual_outcome
+        return {
+            **model_metrics,
+            **guide_metrics,
+            f"KL(q({V.outcome_noise})||p({V.outcome_noise}))": kl,
+        }
 
 
 class TwinNet(pl.LightningModule):
@@ -209,88 +89,193 @@ class TwinNet(pl.LightningModule):
         outcome_noise_dim: int,
         outcome_size: torch.Size,
         lr: float,
-        noise_inject_mode: Literal['concat', 'add', 'multiply'] = 'concat',
-        use_combine_net: bool = True,
-        weight_sharing: bool = True,
+        encoder_lr: float,
+        vqvae: VQVAE,
+        weight_sharing: bool = False,
         activation: ActivationFunc = 'mish',
         batch_norm: bool = False,
     ):
         super().__init__()
-        self.twin_net = DeepTwinNetComponent(
+        kwargs = dict(
             treatment_dim=treatment_dim,
             confounders_dim=confounders_dim,
             outcome_noise_dim=outcome_noise_dim,
             outcome_shape=outcome_size,
-            noise_inject_mode=noise_inject_mode,
-            use_combine_net=use_combine_net,
-            weight_sharing=weight_sharing,
             activation=activation_layer_ctor(activation),
-            batch_norm=batch_norm,
+        )
+        self.twin_net = DeepTwinNet(
+            **kwargs,
+            vqvae=vqvae,
+            weight_sharing=weight_sharing,
+        )
+        self.infer_noise_net = DeepTwinNetNoiseEncoder(
+            **kwargs,
+            include_non_descendants=False,
         )
         self.outcome_noise_dim = outcome_noise_dim
         self.lr = lr
-        self.save_hyperparameters()
+        self.encoder_lr = encoder_lr
+        self.save_hyperparameters(ignore=['vqvae'])
+        self.vqvae = vqvae
+
+        def optimizer_kwargs_for_model_param(module_name, param_name):
+            if module_name == 'twin_net':
+                return dict(lr=lr)
+            elif module_name == 'infer_noise_net':
+                return dict(lr=encoder_lr)
+            else:
+                raise RuntimeError(
+                    f'Unexpected parameter {module_name=}, {param_name=}'
+                )
+
+        self.svi_loss = CustomELBO(
+            num_particles=1,
+            # NOTE: I'm not sure it's possible/easy to vectorize particles
+            # when convolutions are being used as a dimension
+            # gets added to the sampled variables
+            vectorize_particles=False,
+        )
+        self.svi = pyro.infer.SVI(
+            model=self.model,
+            guide=self.guide,
+            optim=pyro.optim.Adam(optimizer_kwargs_for_model_param),
+            loss=self.svi_loss
+        )
 
     def forward(self, x) -> Tuple[Tensor, Tensor]:
         return self.twin_net(**x)
 
-    def _step(self, batch):
-        X, y = batch
+    def _discrete_latent(self, z_q: Tensor) -> Tensor:
+        return self.vqvae.model.codebook(z_q)
 
-        factual_outcome_hat, counterfactual_outcome_hat = self(X)
+    def model(self, batch):
+        pyro.module('twin_net', self.twin_net)
+        input, output = batch
+        batch_size = input[V.factual_treatment].shape[0]
 
-        factual_outcome = y['factual_outcome']
-        counterfactual_outcome = y['counterfactual_outcome']
+        y = self._discrete_latent(output[V.factual_outcome])
+        y_star = self._discrete_latent(output[V.counterfactual_outcome])
+        u_y_loc = torch.zeros(self.outcome_noise_dim, device=self.device)
+        u_y_scale = torch.ones(self.outcome_noise_dim, device=self.device)
 
-        factual_loss = F.mse_loss(factual_outcome_hat, factual_outcome)
-        counterfactual_loss = F.mse_loss(
-            counterfactual_outcome_hat,
-            counterfactual_outcome,
+        with pyro.plate('data', size=batch_size):
+            u_y = pyro.sample(
+                name=V.outcome_noise,
+                fn=Normal(u_y_loc, u_y_scale).to_event(1),
+            )
+
+            input = {**input, V.outcome_noise: u_y}
+            y_, y_star_ = self.twin_net.forward_probs(**input)
+
+            pyro.sample(
+                name=V.factual_outcome,
+                fn=Categorical(probs=y_).to_event(2),
+                obs=y,
+                infer={"enumerate": "parallel"}
+            )
+            pyro.sample(
+                name=V.counterfactual_outcome,
+                fn=Categorical(probs=y_star_).to_event(2),
+                obs=y_star,
+                infer={"enumerate": "parallel"},
+            )
+
+    def guide(self, batch):
+        pyro.module('infer_noise_net', self.infer_noise_net)
+        input, output = batch
+        batch_size = input[V.factual_treatment].shape[0]
+
+        # make sure that the inference network doesn't see the outcome noise
+        assert V.outcome_noise not in input
+
+        u_y_loc_, u_y_scale_ = self.infer_noise_net.forward(
+            factual_treatment=input[V.factual_treatment],
+            counterfactual_treatment=input[V.counterfactual_treatment],
+            confounders=input[V.confounders],
+            factual_outcome=output[V.factual_outcome],
+            counterfactual_outcome=output[V.counterfactual_outcome],
         )
 
-        loss = factual_loss + counterfactual_loss
+        with pyro.plate('data', size=batch_size):
+            u_y_dist = Normal(u_y_loc_, u_y_scale_).to_event(1)
+            pyro.sample(V.outcome_noise, u_y_dist)
 
-        # FIXME: this helps pytorch-lighnting with ambiguos batch sizes
-        # but is otherwise unnecessary
-        batch_size = y['factual_outcome'].shape[0]
-        self.log('batch_size_fix', -1.0, batch_size=batch_size)
+    def backward(self, *args, **kwargs):
+        # no loss to backpropagate as pyro handles optimisation
+        pass
 
-        return loss, dict(
-            loss=loss,
-            factual_loss=factual_loss.item(),
-            counterfactual_loss=counterfactual_loss.item(),
-        )
+    def configure_optimizers(self):
+        # optimisation handled in pyro
+        pass
 
     def training_step(self, batch, _batch_idx):
-        loss, _metrics = self._step(batch)
-        self.log('train_loss', loss.item(), on_step=True, on_epoch=True)
+        loss, metrics = self._step(batch, train=True)
+        train_metrics = keymap('train/'.__add__, metrics)
+        # needed without / to include in the checkpoint filename
+        train_metrics['train_loss'] = metrics['loss']
+        self.log_dict(train_metrics)
         return loss
 
     def validation_step(self, batch, _batch_idx):
-        _loss, metrics = self._step(batch)
-        self.log_dict({f"val_{k}": v for k, v in metrics.items()})
+        _loss, metrics = self._step(batch, train=False)
+        val_metrics = keymap('val/'.__add__, metrics)
+        # needed without / to include in the checkpoint filename
+        val_metrics['val_loss'] = metrics['loss']
+        self.log_dict(val_metrics, on_epoch=True)
 
     def test_step(self, batch, batch_idx):
-        return self.validation_step(batch, batch_idx)
+        _loss, metrics = self._step(batch, train=False)
+        test_metrics = keymap('test/'.__add__, metrics)
+        self.log_dict(test_metrics, on_epoch=True)
 
-    def configure_optimizers(self):
-        return torch.optim.Adam(self.twin_net.parameters(), lr=self.lr)
+    def _step(
+        self,
+        batch: Tuple[BatchDictLike, BatchDictLike],
+        *,
+        train: bool,
+    ):
+        x, y = batch
+
+        # FIXME: for now just ignoring dataset injected noise this should
+        # probably not appear in the dataset from the start
+        x = dissoc(x, V.outcome_noise)
+        batch = (x, y)
+
+        # NOTE: this helps pytorch-lighnting with ambiguos batch sizes
+        # but is otherwise unnecessary
+        batch_size = y[V.factual_outcome].shape[0]
+        self.log('batch_size_fix', float(batch_size), batch_size=batch_size)
+
+        if train:
+            loss = self.svi.step(batch)
+        else:
+            loss = self.svi.evaluate_loss(batch)
+
+        loss = torch.as_tensor(loss / batch_size)
+        svi_metrics = self.svi_loss.get_metrics()
+        metrics = dict(loss=loss, **svi_metrics)
+        return loss, metrics
 
 
 class PSFTwinNet(TwinNet):
     def __init__(
         self,
         outcome_size: torch.Size,
-        # 4.952220800885215e-08
-        # 0.0005,  # 1.7013748158991985e-06 # 4.4157044735331275e-05
-        # 0.001  # 4.952220800885215e-08  # 0.0005  # 0.0005  # 1.7013748158991985e-06
-        lr: float = 0.001
+        lr: float = 0.0002,
+        encoder_lr: float = 0.0002,
+        vqvae: Optional[VQVAE] = None,
     ):
+        if vqvae is None:
+            vqvae = load_best_model(VQVAE)
+
         super().__init__(
             outcome_size=outcome_size,
             treatment_dim=PSFTwinNetDataset.treatment_dim(),
             confounders_dim=PSFTwinNetDataset.confounders_dim(),
-            outcome_noise_dim=PSFTwinNetDataset.outcome_noise_dim,
+            # FIXME: change dataset
+            outcome_noise_dim=12,  # 16,  # 32,  # PSFTwinNetDataset.outcome_noise_dim,
             lr=lr,
+            encoder_lr=encoder_lr,
+            vqvae=vqvae,
         )
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=['vqvae'])

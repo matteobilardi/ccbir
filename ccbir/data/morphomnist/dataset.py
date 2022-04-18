@@ -270,7 +270,7 @@ class PerturbedMorphoMNIST(MorphoMNIST):
         )
 
         df.columns = df.columns.str.split('.', expand=True)
-        df = df.rename(columns={np.NaN: ""})
+        df = df.rename(columns={np.NaN: ''})
 
         def parse_key(k: str) -> Union[str, int]:
             if k.isnumeric():
@@ -281,12 +281,15 @@ class PerturbedMorphoMNIST(MorphoMNIST):
 
         def valid_key(k: str) -> bool:
             assert isinstance(k, str), type(k)
-            return k != ""
+            return k != ''
 
         data = dict()
         for col_keys, col_values in df.items():
             keys = map(parse_key, filter(valid_key, col_keys))
-            values = default_convert_series(col_values)
+            values = default_convert_series(
+                series=col_values,
+                all_numeric_to_float=True,
+            )
             data = assoc_in(data, keys, values)
 
         return data
@@ -322,7 +325,7 @@ class PerturbedMorphoMNIST(MorphoMNIST):
         original_images = original_dataset.images
         original_num_imgs = len(original_images)
 
-        # NOTE: these should be made BatchDict to support arbitrary
+        # NOTE: these could be made BatchDict to support arbitrary
         # perturbations and perturbations' args in a single dataset
         # but since we don't need that for now, just repeating the perturbation
         perturbations_type = repeat(perturbation_type, original_num_imgs)

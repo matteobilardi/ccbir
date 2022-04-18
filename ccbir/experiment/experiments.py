@@ -287,9 +287,12 @@ class PSFTwinNetExperiment:
 
         # resample noise, possibly with differen scale for higher/lower
         # variance
-        X['outcome_noise'] = PSFTwinNetDataset.sample_outcome_noise(
-            sample_shape=X['outcome_noise'].shape,
-            scale=noise_scale,
+        # X['outcome_noise'] = PSFTwinNetDataset.sample_outcome_noise(
+        #    sample_shape=X['outcome_noise'].shape,
+        #    scale=noise_scale,
+        # )
+        X['outcome_noise'] = noise_scale * torch.randn(
+            (num_samples, self.twinnet.outcome_noise_dim),
         )
 
         swollen_embedding_hat, fractured_embedding_hat = self.twinnet(X)
@@ -329,6 +332,10 @@ class PSFTwinNetExperiment:
         # for each original image, generate factual and counterfactual
         # embedding, flatten, run tsne split and plot
         x, _y = self.data.dataset(train)[:num_points]
+        batch_size = x['factual_treatment'].shape[0]
+        x['outcome_noise'] = torch.randn(
+            (batch_size, self.twinnet.outcome_noise_dim)
+        )
         swollen, fractured = self.twinnet.forward(x)
         latents_for_perturbations = dict(
             swollen=swollen,

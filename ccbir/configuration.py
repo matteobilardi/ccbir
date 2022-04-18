@@ -1,11 +1,18 @@
 from pathlib import Path
 import shutil
 import sys
+import os
 import pytorch_lightning as pl
 from typing import Type
 
 
+def _mkdir_if_missing(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 class Config:
+
     @property
     def project_root(self) -> Path:
         return Path(__file__).parent.parent.resolve(strict=True)
@@ -66,9 +73,15 @@ class Config:
 
     @property
     def temporary_data_path(self) -> Path:
-        tmp = Path('/vol/bitbucket/mb8318/ccbir/tmp')
-        tmp.mkdir(parents=True, exist_ok=True)
-        return tmp
+        return _mkdir_if_missing(Path('/vol/bitbucket/mb8318/ccbir/tmp'))
+
+    @property
+    def logs_path(self) -> Path:
+        return _mkdir_if_missing(Path('/vol/bitbucket/mb8318/ccbir/logs'))
+    
+    @property
+    def tensorboard_logs_path(self) -> Path:
+        return _mkdir_if_missing(self.logs_path / 'tb_logs')
 
     def clear_temporary_data(self):
         shutil.rmtree(str(self.temporary_data_path))
@@ -81,9 +94,13 @@ class Config:
             self.project_root,
             self.project_root / 'ccbir',
             self.project_root / 'ccbir/pytorch_vqvae',  # TODO: avoid copy-paste
+            self._submodules_path,
             self._submodules_path / 'deepscm',
+            self._submodules_path / 'shake_drop_pytorch',
         ]
         sys.path.extend(map(str, paths))
+        os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+        os.environ['LD_LIBRARY_PATH'] = '/vol/cuda/11.4.120-cudnn8.2.4/lib64'
 
 
 config = Config()

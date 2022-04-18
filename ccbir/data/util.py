@@ -152,12 +152,17 @@ def random_split_repeated(
     return Subset(dataset, train_idxs), Subset(dataset, val_idxs)
 
 
-def default_convert_series(s: pd.Series) -> Union[np.ndarray, Tensor]:
+def default_convert_series(
+    series: pd.Series,
+    all_numeric_to_float: bool,
+) -> Union[np.ndarray, Tensor]:
     """Attempts conversion to torch tensor type, casting floats to default
     torch datatype (float32)"""
 
-    values = s.to_numpy()
-    if np.issubdtype(values.dtype, np.floating):
+    values = series.to_numpy()
+    if np.issubdtype(values.dtype, np.number) and (
+        np.issubdtype(values.dtype, np.floating) or all_numeric_to_float
+    ):
         default_float_dtype = torch.get_default_dtype()
         return torch.as_tensor(values, dtype=default_float_dtype)
     else:
@@ -172,12 +177,16 @@ def standard_scaler_for(seq: Sequence) -> Callable[[Sequence], Sequence]:
     if isinstance(seq, Tensor):
         assert seq.dim() == 1, seq.dim()
         scaler = StandardScaler()
-        scaler.fit(seq.view(-1, 1).numpy())
+        scaler = scaler.fit(seq.view(-1, 1).numpy())
 
         def scale(t: Tensor):
-            assert seq.dim() == 1, seq.dim()
-            return torch.from_numpy(
-                scaler.transform(t.view(-1, 1).numpy()).flatten()
+            assert t.dim() == 1, t.dim()
+            array = t.view(-1, 1).numpy()
+            normalized_array = scaler.transform(array).flatten()
+
+            return torch.as_tensor(
+                data=normalized_array,
+                dtype=torch.float32,
             )
 
         return scale
