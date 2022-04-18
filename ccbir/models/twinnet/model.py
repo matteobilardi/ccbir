@@ -1,277 +1,28 @@
-
 from enum import Enum
+from functools import partial
 import pyro
 import pyro.optim
 import pyro.infer
-from pyro.distributions import Normal
+from pyro.distributions import Normal, Categorical
+from ccbir.arch import PreActResBlock
+from ccbir.models.twinnet.arch import (
+    DeepTwinNet,
+    DeepTwinNetNoiseEncoder,
+)
+from ccbir.models.util import load_best_model
+from ccbir.models.vqvae.model import VQVAE
 from ccbir.data.util import BatchDictLike
-from ccbir.pytorch_vqvae.modules import ResBlock
 from ccbir.models.twinnet.data import PSFTwinNetDataset
 from ccbir.util import ActivationFunc, activation_layer_ctor
 import pytorch_lightning as pl
-from torch import Tensor, nn
-from typing import Callable, Dict, Literal, Tuple
+from torch import Tensor
+from typing import Dict, Literal, Optional, Tuple
 import torch
-import torch.nn.functional as F
 from toolz import dissoc, keymap
 
 
-class DeepTwinNetComponent(nn.Module):
-    """Twin network for DAG: X -> Y <- Z that allows sampling from
-    P(Y, Y* | X, X*, Z)"""
-
-    def __init__(
-        self,
-        treatment_dim: int,
-        confounders_dim: int,
-        outcome_noise_dim: int,
-        outcome_shape: torch.Size,
-        noise_inject_mode: Literal['concat', 'add', 'multiply'],
-        use_combine_net: bool,
-        weight_sharing: bool,
-        activation: Callable[..., nn.Module],
-        batch_norm: bool,
-    ):
-        super().__init__()
-        self.use_combine_net = use_combine_net
-        self.data_dim = treatment_dim + confounders_dim
-        self.weight_sharing = weight_sharing
-
-        if noise_inject_mode == 'concat':
-            self.input_dim = self.data_dim + outcome_noise_dim
-            self.inject_noise = (
-                lambda data, noise: torch.cat((data, noise), dim=-1)
-            )
-        elif noise_inject_mode == 'add':
-            self.input_dim = self.data_dim
-            self.inject_noise = torch.add
-        elif noise_inject_mode == 'multiply':
-            self.input_dim = self.data_dim
-            self.inject_noise = torch.mul
-        else:
-            raise ValueError(f"Invalid {noise_inject_mode=}")
-
-        # TODO: For clarity consider not using lazy layers once the architecture
-        # is stabilised
-        def linear_layer(out_features: int, batch_norm: bool = batch_norm):
-            layers = []
-            layers.append(nn.LazyLinear(out_features=out_features))
-            if batch_norm:
-                layers.append(nn.LazyBatchNorm1d())
-
-            return nn.Sequential(*layers)
-
-        self.combine_treatment_confounders_net = nn.Sequential(
-            linear_layer(self.data_dim),
-            activation(),
-            linear_layer(self.data_dim),
-        ) if use_combine_net else None
-
-        # to inject noise via multiplication/addition, we currently force
-        # the reparametrised noise to have the same number of dimensions as the
-        # data (i.e. [treatement, confounders]) regardless of the value of
-        # outcome_noise_dim, which is just the size of the input to the
-        # reparametrize_noise_net. For pure convenience, currently this is the
-        # case even when we inject noise by concatenation
-        self.reparametrize_noise_net = nn.Sequential(
-            linear_layer(512),
-            activation(),
-            linear_layer(outcome_noise_dim),
-        )
-
-        D = 64  # 8  # 64  # base dim
-        # best so far ~ 0.035 loss on training set
-
-        def make_branch():
-            return nn.Sequential(
-                nn.Unflatten(1, (-1, 1, 1)),
-                nn.LazyConvTranspose2d(16 * D, 3),
-                nn.LazyBatchNorm2d(),
-                activation(),
-                nn.LazyConvTranspose2d(8 * D, 3),
-                nn.LazyBatchNorm2d(),
-                activation(),
-                nn.LazyConvTranspose2d(4 * D, 3),
-                nn.LazyBatchNorm2d(),
-                activation(),
-                nn.LazyConvTranspose2d(2 * D, 3),
-                nn.LazyBatchNorm2d(),
-                activation(),
-                ResBlock(2 * D, activation),
-                ResBlock(2 * D, activation),
-                nn.LazyConv2d(D, 1),
-                ResBlock(D, activation),
-                nn.LazyConv2d(2, 2),
-            )
-
-        self.predict_y = make_branch()
-        self.predict_y_star = (
-            self.predict_y if weight_sharing else make_branch()
-        )
-
-        # force lazy init
-        # init lazy modules
-        dummy_batch_size = 64
-        x = torch.randn(dummy_batch_size, treatment_dim)
-        x_star = x.clone()
-        z = torch.randn(dummy_batch_size, confounders_dim)
-        u_y = torch.randn(dummy_batch_size, outcome_noise_dim)
-
-        dummy_y, dummy_y_star = self.forward(
-            factual_treatment=x,
-            counterfactual_treatment=x_star,
-            confounders=z,
-            outcome_noise=u_y,
-        )
-
-        assert dummy_y.shape[1:] == outcome_shape
-        assert dummy_y_star.shape[1:] == outcome_shape
-
-    def combine_treatment_confounders(
-        self,
-        treatment: Tensor,
-        confounders: Tensor,
-    ) -> Tensor:
-        combined = torch.cat((treatment, confounders), dim=-1)
-        if self.use_combine_net:
-            combined = self.combine_treatment_confounders_net(combined)
-
-        return combined
-
-    def forward(
-        self,
-        factual_treatment: Tensor,
-        counterfactual_treatment: Tensor,
-        confounders: Tensor,
-        outcome_noise: Tensor,
-    ) -> Tuple[Tensor, Tensor]:
-
-        x_and_z_enc = self.combine_treatment_confounders(
-            factual_treatment,
-            confounders,
-        )
-        x_star_and_z_enc = self.combine_treatment_confounders(
-            counterfactual_treatment,
-            confounders
-        )
-        #u_y_enc = outcome_noise
-        u_y_enc = self.reparametrize_noise_net(outcome_noise)
-        x_and_z_and_u_y_enc = self.inject_noise(x_and_z_enc, u_y_enc)
-        x_star_and_z_and_u_y_enc = self.inject_noise(x_star_and_z_enc, u_y_enc)
-        factual_outcome = self.predict_y(x_and_z_and_u_y_enc)
-        counterfactual_outcome = self.predict_y_star(x_star_and_z_and_u_y_enc)
-
-        return factual_outcome, counterfactual_outcome
-
-
-class DeepTwinNetNoiseEncoder(nn.Module):
-    def __init__(
-        self,
-        treatment_dim: int,
-        confounders_dim: int,
-        outcome_noise_dim: int,
-        outcome_shape: torch.Size,
-        activation: Callable[..., nn.Module],
-        weight_sharing: bool,
-    ):
-        super().__init__()
-        self.treatment_dim = treatment_dim
-        self.confounders_dim = confounders_dim
-        self.outcome_noise_dim = outcome_noise_dim
-        self.outcome_shape = outcome_shape
-        self.activation = activation
-        self.weight_sharing = weight_sharing
-
-        YD = outcome_shape.numel()
-        YC = outcome_shape[0]  # channels outcome
-
-        # NOTE: for now this doesn't reduce the overall dimensions,
-        # but just flattens the outcome space to a vector
-        def outcome_encoder():
-            return nn.Sequential(
-                nn.LazyConv2d(YD, 3, 1),
-                nn.LazyBatchNorm2d(),
-                activation(),
-                nn.LazyConv2d(4 * YD, 3, 1),
-                nn.LazyBatchNorm2d(),
-                activation(),
-                nn.LazyConv2d(4 * YD, 2, 1),
-                nn.LazyBatchNorm2d(),
-                activation(),
-                nn.LazyConv2d(2 * YD, 2, 1),
-                nn.LazyBatchNorm2d(),
-                activation(),
-                nn.LazyConv2d(YD, 2, 1),
-                nn.Flatten(),
-            )
-
-        ND = outcome_noise_dim
-        NW = 16  # (stands for noise width) scales architecture easily
-
-        def noise_encoder():
-            return nn.Sequential(
-                nn.LazyLinear(512),
-                nn.LazyBatchNorm1d(),
-                activation(),
-                nn.LazyLinear(2 * NW * ND),
-                nn.LazyBatchNorm1d(),
-                activation(),
-                nn.LazyLinear(2 * ND),
-            )
-
-        self.encode_y = outcome_encoder()
-        self.encode_y_star = (
-            self.encode_y if weight_sharing else outcome_encoder()
-        )
-        self.predict_u_y = noise_encoder()
-
-        # init lazy modules
-        dummy_batch_size = 64
-        x = torch.randn(dummy_batch_size, treatment_dim)
-        x_star = x.clone()
-        z = torch.randn(dummy_batch_size, confounders_dim)
-        y = torch.randn(dummy_batch_size, *outcome_shape)
-        y_star = y.clone()
-
-        dummy_u_y_loc, dummy_u_y_scale = self.forward(
-            factual_treatment=x,
-            counterfactual_treatment=x_star,
-            confounders=z,
-            factual_outcome=y,
-            counterfactual_outcome=y_star,
-        )
-
-        assert dummy_u_y_loc.shape == (dummy_batch_size, outcome_noise_dim)
-        assert dummy_u_y_scale.shape == (dummy_batch_size, outcome_noise_dim)
-
-    def forward(
-        self,
-        factual_treatment: Tensor,
-        counterfactual_treatment: Tensor,
-        confounders: Tensor,
-        factual_outcome: Tensor,
-        counterfactual_outcome: Tensor,
-    ) -> Tensor:
-        y_enc = self.encode_y(factual_outcome)
-        y_star_enc = self.encode_y_star(counterfactual_outcome)
-
-        inputs = torch.cat((
-            factual_treatment,
-            counterfactual_treatment,
-            confounders,
-            y_enc,
-            y_star_enc,
-        ), dim=-1)
-
-        u_y_loc, log_u_y_scale = (
-            torch.chunk(self.predict_u_y(inputs), 2, dim=-1)
-        )
-        u_y_scale = torch.exp(log_u_y_scale)
-
-        return u_y_loc, u_y_scale
-
-
 class V:
+    """Model variables"""
     # TODO: there must be a better way to refer to random variables in pyro
     # but alas it's strings for now...
     factual_treatment: str = 'factual_treatment'
@@ -283,6 +34,7 @@ class V:
 
 
 class CustomELBO(pyro.infer.TraceMeanField_ELBO):
+    """Analytical KL ELBO that tracks metrics about the model variables"""
     # inspired by deepscm codebase
 
     def __init__(self, *args, **kwargs):
@@ -325,111 +77,8 @@ class CustomELBO(pyro.infer.TraceMeanField_ELBO):
         return {
             **model_metrics,
             **guide_metrics,
-            # TODO: not completely sure this is what I'm extracting from pyro
-            f"KL(q({V.outcome_noise}|everything)||p({V.outcome_noise}))": kl,
+            f"KL(q({V.outcome_noise})||p({V.outcome_noise}))": kl,
         }
-
-
-def compute_optimal_sigma(
-    estimate_batch: Tensor,
-    target_batch: Tensor,
-) -> Tensor:
-    assert estimate_batch.shape == target_batch.shape
-    # based on https://orybkin.github.io/sigma-vae/
-    # note that variance is calculated across all datapoints in the batch
-    # as is done in the sigma-vae paper
-    return (
-        ((estimate_batch - target_batch) ** 2)
-        .mean(dim=[0, 1, 2, 3], keepdim=True)
-        .sqrt()
-        .expand_as(estimate_batch)
-    )
-
-
-class Stage(Enum):
-    TRAIN = 'train'
-    VAL = 'val'
-    TEST = 'test'
-    PREDICT = 'predict'
-
-
-class ValidationOptimalSigma:
-    def __init__(
-        self,
-        stage: Stage,
-    ) -> None:
-        self._val_variances = []
-        self._stage = stage
-        self._val_optimal_sigma = None
-
-    def set_stage(self, stage: Stage):
-        if self._stage == stage:
-            return
-
-        if stage == Stage.TRAIN and len(self._val_variances) > 0:
-            # element-wise mean sigma of the validation sigmas
-            val_optimal_variance = torch.mean(
-                input=torch.stack(self._val_variances),
-                dim=0,
-            )
-            self._val_optimal_sigma = val_optimal_variance.sqrt()
-        elif stage == Stage.VAL:
-            self._val_optimal_sigma = None
-        else:
-            # predicting or testing
-            pass
-
-        self._val_variances.clear()
-        self._stage = stage
-
-    def _compute_optimal_variance(
-        self,
-        estimate_batch: Tensor,
-        target_batch: Tensor,
-    ) -> Tensor:
-        assert estimate_batch.shape == target_batch.shape
-        n = estimate_batch.numel()
-        unbiased_variance = (
-            ((estimate_batch - target_batch) ** 2).sum() / (n - 1)
-        )
-
-        # NOTE: this is a scalar
-        return unbiased_variance
-
-    def __call__(
-        self,
-        estimate_batch: Tensor,
-        target_batch: Tensor,
-    ) -> Tensor:
-        if self._val_optimal_sigma is None:
-            if self._stage == Stage.TRAIN:
-                # validation hasn't run yet, so just compute the optimal sigma
-                # on the training set
-                return compute_optimal_sigma(estimate_batch, target_batch)
-            elif self._stage == Stage.VAL:
-                # accumulate optimal variances during validation
-                variance = self._compute_optimal_variance(
-                    estimate_batch,
-                    target_batch,
-                )
-
-                self._val_variances.append(variance)
-                sigma = variance.sqrt().expand_as(estimate_batch)
-                return sigma
-            else:
-                # predicting or testing, don't use optimal sigma
-                return torch.ones_like(estimate_batch)
-        else:
-            if self._stage == Stage.TRAIN:
-                return self._val_optimal_sigma.expand_as(estimate_batch)
-            elif self._stage == Stage.VAL:
-                raise RuntimeError(
-                    "Unreachable code: we don't compute the optimal sigma to"
-                    "be used during training while still in validation stage"
-                )
-            else:
-                # predicting or testing, don't use optimal sigma
-                return torch.ones_like(estimate_batch)
 
 
 class TwinNet(pl.LightningModule):
@@ -441,50 +90,33 @@ class TwinNet(pl.LightningModule):
         outcome_size: torch.Size,
         lr: float,
         encoder_lr: float,
-        factual_loss_scale: float = 0.8,
-        val_optimal_sigma: bool = True,
-        noise_inject_mode: Literal['concat', 'add', 'multiply'] = 'concat',
-        use_combine_net: bool = True,
+        vqvae: VQVAE,
         weight_sharing: bool = False,
         activation: ActivationFunc = 'mish',
         batch_norm: bool = False,
     ):
         super().__init__()
-        # TODO: may want to refactor verbose argument passing
-        self.twin_net = DeepTwinNetComponent(
+        kwargs = dict(
             treatment_dim=treatment_dim,
             confounders_dim=confounders_dim,
             outcome_noise_dim=outcome_noise_dim,
             outcome_shape=outcome_size,
-            noise_inject_mode=noise_inject_mode,
-            use_combine_net=use_combine_net,
-            weight_sharing=weight_sharing,
             activation=activation_layer_ctor(activation),
-            batch_norm=batch_norm,
+        )
+        self.twin_net = DeepTwinNet(
+            **kwargs,
+            vqvae=vqvae,
+            weight_sharing=weight_sharing,
         )
         self.infer_noise_net = DeepTwinNetNoiseEncoder(
-            treatment_dim=treatment_dim,
-            confounders_dim=confounders_dim,
-            outcome_noise_dim=outcome_noise_dim,
-            outcome_shape=outcome_size,
-            activation=activation_layer_ctor(activation),
-            weight_sharing=False,
+            **kwargs,
+            include_non_descendants=False,
         )
         self.outcome_noise_dim = outcome_noise_dim
         self.lr = lr
         self.encoder_lr = encoder_lr
-
-        assert 0.0 < factual_loss_scale < 2.0, factual_loss_scale
-        self.factual_loss_scale = factual_loss_scale
-        self.counterfactual_loss_scale = 2.0 - factual_loss_scale
-        self.val_optimal_sigma = val_optimal_sigma
-        self.save_hyperparameters()
-
-        self.stage = Stage.TRAIN
-        self.optimal_sigma = (
-            ValidationOptimalSigma(self.stage) if val_optimal_sigma else
-            compute_optimal_sigma
-        )
+        self.save_hyperparameters(ignore=['vqvae'])
+        self.vqvae = vqvae
 
         def optimizer_kwargs_for_model_param(module_name, param_name):
             if module_name == 'twin_net':
@@ -493,9 +125,9 @@ class TwinNet(pl.LightningModule):
                 return dict(lr=encoder_lr)
             else:
                 raise RuntimeError(
-                    f'Unexpected parameter {module_name=}, {param_name=}')
+                    f'Unexpected parameter {module_name=}, {param_name=}'
+                )
 
-        # analytical KL ELBO
         self.svi_loss = CustomELBO(
             num_particles=1,
             # NOTE: I'm not sure it's possible/easy to vectorize particles
@@ -513,44 +145,40 @@ class TwinNet(pl.LightningModule):
     def forward(self, x) -> Tuple[Tensor, Tensor]:
         return self.twin_net(**x)
 
+    def _discrete_latent(self, z_q: Tensor) -> Tensor:
+        return self.vqvae.model.codebook(z_q)
+
     def model(self, batch):
         pyro.module('twin_net', self.twin_net)
         input, output = batch
         batch_size = input[V.factual_treatment].shape[0]
 
-        y: Tensor = output[V.factual_outcome]
-        y_star: Tensor = output[V.counterfactual_outcome]
+        y = self._discrete_latent(output[V.factual_outcome])
+        y_star = self._discrete_latent(output[V.counterfactual_outcome])
         u_y_loc = torch.zeros(self.outcome_noise_dim, device=self.device)
         u_y_scale = torch.ones(self.outcome_noise_dim, device=self.device)
 
         with pyro.plate('data', size=batch_size):
-            u_y_dist = Normal(u_y_loc, u_y_scale).to_event(1)
-            u_y = pyro.sample(V.outcome_noise, u_y_dist)
+            u_y = pyro.sample(
+                name=V.outcome_noise,
+                fn=Normal(u_y_loc, u_y_scale).to_event(1),
+            )
 
             input = {**input, V.outcome_noise: u_y}
-            y_, y_star_ = self.forward(input)
+            y_, y_star_ = self.twin_net.forward_probs(**input)
 
-            y_event_dim = y_.dim() - 1
-            assert y_event_dim == y_star_.dim() - 1
-            y_loc = y_
-            y_scale = self.optimal_sigma(y_, y)
-            y_dist = Normal(y_loc, y_scale).to_event(y_event_dim)
-
-            y_star_loc = y_star_
-            y_star_scale = self.optimal_sigma(y_star_, y_star)
-            y_star_dist = (
-                Normal(y_star_loc, y_star_scale).to_event(y_event_dim)
+            pyro.sample(
+                name=V.factual_outcome,
+                fn=Categorical(probs=y_).to_event(2),
+                obs=y,
+                infer={"enumerate": "parallel"}
             )
-
-            self._log_optimal_sigmas(
-                factual_sigma=y_scale,
-                counterfactual_sigma=y_star_scale,
+            pyro.sample(
+                name=V.counterfactual_outcome,
+                fn=Categorical(probs=y_star_).to_event(2),
+                obs=y_star,
+                infer={"enumerate": "parallel"},
             )
-
-            with pyro.poutine.scale(scale=self.factual_loss_scale):
-                pyro.sample(V.factual_outcome, y_dist, obs=y)
-            with pyro.poutine.scale(scale=self.counterfactual_loss_scale):
-                pyro.sample(V.counterfactual_outcome, y_star_dist, obs=y_star)
 
     def guide(self, batch):
         pyro.module('infer_noise_net', self.infer_noise_net)
@@ -579,27 +207,6 @@ class TwinNet(pl.LightningModule):
     def configure_optimizers(self):
         # optimisation handled in pyro
         pass
-
-    def set_stage(self, stage: Stage):
-        self.stage = stage
-        if isinstance(self.optimal_sigma, ValidationOptimalSigma):
-            self.optimal_sigma.set_stage(stage)
-
-    def on_train_epoch_start(self):
-        super().on_train_epoch_start()
-        self.set_stage(Stage.TRAIN)
-
-    def on_validation_epoch_start(self):
-        super().on_validation_epoch_start()
-        self.set_stage(Stage.VAL)
-
-    def on_test_epoch_start(self):
-        super().on_test_epoch_start()
-        self.set_stage(Stage.TEST)
-
-    def on_predict_epoch_start(self) -> None:
-        super().on_predict_epoch_start()
-        self.set_stage(Stage.PREDICT)
 
     def training_step(self, batch, _batch_idx):
         loss, metrics = self._step(batch, train=True)
@@ -646,47 +253,29 @@ class TwinNet(pl.LightningModule):
 
         loss = torch.as_tensor(loss / batch_size)
         svi_metrics = self.svi_loss.get_metrics()
-
-        return loss, dict(
-            loss=loss,
-            **svi_metrics,
-        )
-
-    def _log_optimal_sigmas(
-        self,
-        factual_sigma: Tensor,
-        counterfactual_sigma: Tensor
-    ):
-        factual_sigma_: Tensor = factual_sigma.unique()
-        counterfactual_sigma_: Tensor = counterfactual_sigma.unique()
-        assert factual_sigma_.numel() == 1
-        assert counterfactual_sigma_.numel() == 1
-        factual_sigma_scalar = factual_sigma_[0].item()
-        counterfactual_sigma_scalar = counterfactual_sigma_[0].item()
-        stage = self.stage.value
-        self.log_dict({
-            f"{stage}/factual_sigma": factual_sigma_scalar,
-            f"{stage}/counterfactual_sigma": counterfactual_sigma_scalar,
-        })
+        metrics = dict(loss=loss, **svi_metrics)
+        return loss, metrics
 
 
 class PSFTwinNet(TwinNet):
     def __init__(
         self,
         outcome_size: torch.Size,
-        # 4.952220800885215e-08
-        # 0.0005,  # 1.7013748158991985e-06 # 4.4157044735331275e-05
-        # 0.001  # 4.952220800885215e-08  # 0.0005  # 0.0005  # 1.7013748158991985e-06
-        lr: float = 0.0001,  # 0.0005, # try with 0.0001 next
-        encoder_lr: float = 0.0005,
+        lr: float = 0.0002,
+        encoder_lr: float = 0.0002,
+        vqvae: Optional[VQVAE] = None,
     ):
+        if vqvae is None:
+            vqvae = load_best_model(VQVAE)
+
         super().__init__(
             outcome_size=outcome_size,
             treatment_dim=PSFTwinNetDataset.treatment_dim(),
             confounders_dim=PSFTwinNetDataset.confounders_dim(),
             # FIXME: change dataset
-            outcome_noise_dim=32,  # PSFTwinNetDataset.outcome_noise_dim,
+            outcome_noise_dim=12,  # 16,  # 32,  # PSFTwinNetDataset.outcome_noise_dim,
             lr=lr,
             encoder_lr=encoder_lr,
+            vqvae=vqvae,
         )
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=['vqvae'])

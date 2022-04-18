@@ -170,7 +170,7 @@ _activation_layer_ctor = {
 
 def activation_layer_ctor(
     func_name: ActivationFunc,
-    inplace: bool = True,
+    inplace: bool = False,
 ) -> Callable[..., nn.Module]:
     try:
         layer_ctor = _activation_layer_ctor[func_name]

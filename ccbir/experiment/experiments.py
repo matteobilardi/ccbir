@@ -332,6 +332,10 @@ class PSFTwinNetExperiment:
         # for each original image, generate factual and counterfactual
         # embedding, flatten, run tsne split and plot
         x, _y = self.data.dataset(train)[:num_points]
+        batch_size = x['factual_treatment'].shape[0]
+        x['outcome_noise'] = torch.randn(
+            (batch_size, self.twinnet.outcome_noise_dim)
+        )
         swollen, fractured = self.twinnet.forward(x)
         latents_for_perturbations = dict(
             swollen=swollen,

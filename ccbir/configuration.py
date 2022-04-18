@@ -94,7 +94,9 @@ class Config:
             self.project_root,
             self.project_root / 'ccbir',
             self.project_root / 'ccbir/pytorch_vqvae',  # TODO: avoid copy-paste
+            self._submodules_path,
             self._submodules_path / 'deepscm',
+            self._submodules_path / 'shake_drop_pytorch',
         ]
         sys.path.extend(map(str, paths))
         os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
