@@ -117,14 +117,15 @@ class VQVAEComponent(nn.Module):
 
         # overwrite encoder/decoder from parent class
         self.encoder = nn.Sequential(
-            nn.Conv2d(C, 4 * W * L, 4, 2, bias=False),
-            nn.BatchNorm2d(4 * W * L),
+            nn.Conv2d(C, 32, 4, 2, bias=False),
+            nn.BatchNorm2d(32),
             activation(),
-            nn.Conv2d(4 * W * L, 2 * W * L, 3, 1, bias=False),
-            nn.BatchNorm2d(2 * W * L),
+            nn.Conv2d(32, 64, 3, 1, bias=False),
+            nn.BatchNorm2d(64),
             activation(),
-            nn.Conv2d(2 * W * L, L, 4, 1),
-            resblocks(2, L, L, activation=activation),
+            nn.Conv2d(64, 64, 4, 1),
+            resblocks(4, 64, 64, activation=activation),
+            nn.Conv2d(64, L, 1),
         )
         self.vq = VectorQuantizer(
             num_embeddings=codebook_size,
@@ -132,15 +133,14 @@ class VQVAEComponent(nn.Module):
             commitment_cost=commitment_cost,
         )
         self.decoder = nn.Sequential(
-            resblocks(2, L, L, activation=activation),
+            # scales 8x8 to 32x32
+            nn.Upsample(scale_factor=4, mode='nearest'),
+            nn.Conv2d(L, 64, 3, 1, bias=False),
+            nn.BatchNorm2d(64),
             activation(),
-            nn.ConvTranspose2d(L, 2 * W * L, 4, 1, bias=False),
-            nn.BatchNorm2d(2 * W * L),
-            activation(),
-            nn.ConvTranspose2d(2 * W * L, 4 * W * L, 3, 1, bias=False),
-            nn.BatchNorm2d(4 * W * L),
-            activation(),
-            nn.ConvTranspose2d(4 * W * L, C, 4, 2),
+            nn.Conv2d(64, 64, 3, 1, bias=False),
+            resblocks(4, 64, 64, activation=activation),
+            nn.Conv2d(64, C, 1),
             nn.Tanh()
         )
 
@@ -175,13 +175,13 @@ class VQVAE(pl.LightningModule):
     def __init__(
         self,
         in_channels: int = 1,
-        codebook_size: int = 1024,         # K
+        codebook_size: int = 128,         # K
         latent_dim: int = 2,  # 8,  # 16         # dimension of z
         commit_loss_weight: float = 0.25,  # 1.0,  # beta
-        lr: float = 2e-4,
+        lr: float = 1e-4,
         activation: ActivationFunc = 'mish',
         width_scale: int = 16,  # 8,  # influences width of convolutional layers
-        vector_quantizer_strength: float = 0.5,
+        vector_quantizer_strength: float = 1.0,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -209,7 +209,11 @@ class VQVAE(pl.LightningModule):
         )
 
     def forward(self, x):
-        return self.model.forward(x)
+        output = self.model.forward(x)
+        x_recon = output['recon']
+        z_e = output['encoder_output']
+        z_q = output['decoder_input']
+        return x_recon, z_e, z_q
 
     def encode(self, x):
         """Discrete latent embedding e_x"""
