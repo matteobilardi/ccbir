@@ -35,7 +35,6 @@ class V:
 
 class CustomELBO(pyro.infer.TraceMeanField_ELBO):
     """Analytical KL ELBO that tracks metrics about the model variables"""
-    # inspired by deepscm codebase
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -110,7 +109,7 @@ class TwinNet(pl.LightningModule):
         )
         self.infer_noise_net = DeepTwinNetNoiseEncoder(
             **kwargs,
-            include_non_descendants=False,
+            include_non_descendants=True,
         )
         self.outcome_noise_dim = outcome_noise_dim
         self.lr = lr
@@ -146,7 +145,9 @@ class TwinNet(pl.LightningModule):
         return self.twin_net(**x)
 
     def _discrete_latent(self, z_q: Tensor) -> Tensor:
-        return self.vqvae.model.codebook(z_q)
+        with torch.no_grad():
+            z_q_, e, _loss = self.vqvae.model.vq(z_q)
+            return e
 
     def model(self, batch):
         pyro.module('twin_net', self.twin_net)
@@ -171,13 +172,11 @@ class TwinNet(pl.LightningModule):
                 name=V.factual_outcome,
                 fn=Categorical(probs=y_).to_event(2),
                 obs=y,
-                infer={"enumerate": "parallel"}
             )
             pyro.sample(
                 name=V.counterfactual_outcome,
                 fn=Categorical(probs=y_star_).to_event(2),
                 obs=y_star,
-                infer={"enumerate": "parallel"},
             )
 
     def guide(self, batch):
@@ -273,7 +272,7 @@ class PSFTwinNet(TwinNet):
             treatment_dim=PSFTwinNetDataset.treatment_dim(),
             confounders_dim=PSFTwinNetDataset.confounders_dim(),
             # FIXME: change dataset
-            outcome_noise_dim=12,  # 16,  # 32,  # PSFTwinNetDataset.outcome_noise_dim,
+            outcome_noise_dim=8,  # 16,  # 32,  # PSFTwinNetDataset.outcome_noise_dim,
             lr=lr,
             encoder_lr=encoder_lr,
             vqvae=vqvae,

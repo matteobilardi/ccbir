@@ -240,7 +240,7 @@ class PSFTwinNetExperiment:
         the learned codebook"""
 
         with torch.no_grad():
-            e_x = self.vqvae.model.codebook(z_e_x)
+            _, e_x, _ = self.vqvae.model.vq(z_e_x)
             x_recon = self.vqvae.decode(e_x)
 
         return x_recon

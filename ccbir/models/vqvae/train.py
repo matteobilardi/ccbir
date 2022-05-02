@@ -1,4 +1,5 @@
 from ccbir.configuration import config
+config.pythonpath_fix()
 from ccbir.models.vqvae.data import VQVAEMorphoMNISTDataModule
 from ccbir.models.vqvae.model import VQVAE
 from pytorch_lightning.loggers import TensorBoardLogger

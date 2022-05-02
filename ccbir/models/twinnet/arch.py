@@ -43,10 +43,10 @@ class DeepTwinNet(nn.Module):
                 nn.Upsample(scale_factor=32, mode='nearest'),
                 nn.Conv2d(self.input_dim, 128, 3, 1, 1, bias=False),
                 # num_blocks, in_channels, out_channels, stride
-                resblocks(2, 128, 64),
-                resblocks(2, 64, 64, 2),
-                resblocks(2, 64, 64, 2),
-                nn.Conv2d(64, 1024, 1),
+                resblocks(2, 128, 32),
+                resblocks(2, 32, 32, 2),
+                resblocks(2, 32, 64, 2),
+                nn.Conv2d(64, vqvae.codebook_size, 1),
                 nn.Softmax2d(),
             )
 
@@ -86,9 +86,8 @@ class DeepTwinNet(nn.Module):
             outcome_noise=outcome_noise,
         )
         # TODO: refactor trainwrecks/stop dependening on vqvae
-        y = self.vqvae.model.codebook.embedding(y_discrete).permute(0, 3, 1, 2)
-        y_star = self.vqvae.model.codebook.embedding(
-            y_star_discrete).permute(0, 3, 1, 2)
+        y = self.vqvae.model.vq.quantize_encoding(y_discrete)
+        y_star = self.vqvae.model.vq.quantize_encoding(y_star_discrete)
 
         return y, y_star
 
@@ -139,8 +138,10 @@ class DeepTwinNet(nn.Module):
         # to be on the last dimension but softmax2d was applied to the
         # channel dimentsion so make channel dimension the last one
         factual_outcome = self.predict_y(factual_input).permute(0, 2, 3, 1)
-        counterfactual_outcome = self.predict_y_star(
-            counterfactual_input).permute(0, 2, 3, 1)
+        counterfactual_outcome = (
+            self.predict_y_star(counterfactual_input)
+            .permute(0, 2, 3, 1)
+        )
 
         return factual_outcome, counterfactual_outcome
 
@@ -236,7 +237,7 @@ class DeepTwinNetNoiseEncoder(nn.Module):
         # stack feature maps from all conditioning vars
         condition = torch.cat(condition_vars, dim=1)
         u_y_loc, log_u_y_scale = (
-            torch.chunk(self.predict_u_y(condition), 2, dim=-1)
+            torch.chunk(self.predict_u_y(condition), chunks=2, dim=-1)
         )
         u_y_scale = torch.exp(log_u_y_scale)
 

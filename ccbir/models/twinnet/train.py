@@ -62,7 +62,7 @@ def main():
                     save_on_train_epoch_end=True,
                 ),
             ],
-            max_epochs=2,
+            max_epochs=5000,
             gpus=1,
             #profiler='advanced',
         ),

@@ -1,3 +1,4 @@
+from einops import rearrange
 from ccbir.arch import PreActResBlock
 from ccbir.util import ActivationFunc, activation_layer_ctor
 from functools import partial
@@ -6,91 +7,66 @@ from torch import Tensor, nn
 from typing import Callable, Literal
 import torch
 import torch.nn.functional as F
+from vector_quantize_pytorch import VectorQuantize
+from toolz import keymap
 
 
-class VectorQuantizer(nn.Module):
-    """Class adapted from https://github.com/zalandoresearch/pytorch-vq-vae"""
-
+class VectorQuantizer(VectorQuantize):
     def __init__(
         self,
-        num_embeddings: int,
-        embedding_dim: int,
-        commitment_cost: float,
+        dim,
+        codebook_size,
+        n_embed=None,
+        codebook_dim=None,
+        decay=0.8,
+        eps=0.00001,
+        kmeans_init=False,
+        kmeans_iters=10,
+        use_cosine_sim=False,
+        threshold_ema_dead_code=0,
+        channel_last=True,
+        accept_image_fmap=False,
+        commitment_weight=None,
+        commitment=1,
+        orthogonal_reg_weight=0,
+        orthogonal_reg_active_codes_only=False,
+        orthogonal_reg_max_codes=None,
+        sample_codebook_temp=0,
+        sync_codebook=False
     ):
-        super().__init__()
-
-        self._embedding_dim = embedding_dim
-        self._num_embeddings = num_embeddings
-
-        self._embedding = nn.Embedding(
-            num_embeddings=self._num_embeddings,
-            embedding_dim=self._embedding_dim,
+        super().__init__(
+            dim,
+            codebook_size,
+            n_embed,
+            codebook_dim,
+            decay,
+            eps,
+            kmeans_init,
+            kmeans_iters,
+            use_cosine_sim,
+            threshold_ema_dead_code,
+            channel_last,
+            accept_image_fmap,
+            commitment_weight,
+            commitment,
+            orthogonal_reg_weight,
+            orthogonal_reg_active_codes_only,
+            orthogonal_reg_max_codes,
+            sample_codebook_temp,
+            sync_codebook
         )
-        self._embedding.weight.data.uniform_(
-            (-1.0 / self._num_embeddings),
-            (1.0 / self._num_embeddings),
-        )
-        self._commitment_cost = commitment_cost
-
-    def forward(self, inputs):
-        # convert inputs from BCHW -> BHWC
-        inputs = inputs.permute(0, 2, 3, 1).contiguous()
-        input_shape = inputs.shape
-
-        # Flatten input
-        flat_input = inputs.view(-1, self._embedding_dim)
-
-        # Calculate distances
-        distances = (
-            torch.sum(flat_input ** 2, dim=1, keepdim=True)
-            - 2 * flat_input @ self._embedding.weight.t()
-            + torch.sum(self._embedding.weight ** 2, dim=1)
-        )
-
-        # Encoding
-        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
-        encodings = torch.zeros(
-            size=(encoding_indices.shape[0], self._num_embeddings),
-            device=inputs.device,
-        )
-        encodings.scatter_(1, encoding_indices, 1)
-
-        # Quantize and unflatten
-        quantized = (encodings @ self._embedding.weight).view(input_shape)
-
-        # Loss
-        e_latent_loss = F.mse_loss(quantized.detach(), inputs)
-        q_latent_loss = F.mse_loss(quantized, inputs.detach())
-        loss = q_latent_loss + self._commitment_cost * e_latent_loss
-        quantized = inputs + (quantized - inputs).detach()
-
-        """
-        avg_probs = torch.mean(encodings, dim=0)
-        perplexity = torch.exp(
-            - torch.sum(avg_probs * torch.log(avg_probs + 1e-10))
-        )
-        """
-
-        discrete_latent = encoding_indices.view(*input_shape[:-1])
-        # convert quantized from BHWC -> BCHW
-        quantized = quantized.permute(0, 3, 1, 2).contiguous()
-
-        return discrete_latent, quantized, loss
 
     def quantize_encoding(
         self,
         encoding: Tensor
     ) -> Tensor:
-        e_flat = encoding.flatten(start_dim=1)
-        encodings = torch.zeros(
-            size=(e_flat.shape[0], self._num_embeddings),
-            device=encoding.device,
-        )
-        encodings.scatter_(1, e_flat, 1)
-        z_q_flat = (encodings @ self._embedding.weight)
-        z_q = z_q_flat.view((*encoding.shape, -1))
-        z_q = z_q.permute(0, 3, 1, 2).contiguous()
-        return z_q
+        _b, h, w = encoding.shape
+        encoding_idxs = rearrange(encoding, 'b h w -> b (h w)')
+        quantized = F.embedding(encoding_idxs, self._codebook.embed)
+        if self.accept_image_fmap:
+            quantized = rearrange(quantized, 'b (h w) c -> b c h w', h=h, w=w)
+
+        return quantized
 
 
 class VQVAEComponent(nn.Module):
@@ -128,9 +104,14 @@ class VQVAEComponent(nn.Module):
             nn.Conv2d(64, L, 1),
         )
         self.vq = VectorQuantizer(
-            num_embeddings=codebook_size,
-            embedding_dim=latent_dim,
-            commitment_cost=commitment_cost,
+            dim=latent_dim,
+            codebook_size=codebook_size,
+            use_cosine_sim=True,
+            accept_image_fmap=True,
+            decay=0.99,
+            commitment_weight=commitment_cost,
+            threshold_ema_dead_code=2,
+            # sample_codebook_temp=0.1,
         )
         self.decoder = nn.Sequential(
             # scales 8x8 to 32x32
@@ -146,7 +127,7 @@ class VQVAEComponent(nn.Module):
 
     def encode(self, x: Tensor):
         z_e = self.encoder(x)
-        e, _z_q = self.vq(z_e)
+        _z_q, e, = self.vq(z_e)
         return e
 
     def decode(self, discrete_latent: Tensor):
@@ -156,7 +137,7 @@ class VQVAEComponent(nn.Module):
 
     def forward(self, x: Tensor):
         z_e = self.encoder(x)
-        e, z_q, vq_loss = self.vq(z_e)
+        z_q, e, vq_loss = self.vq(z_e)
         x_recon = self.decoder(z_q)
 
         return dict(
@@ -175,10 +156,10 @@ class VQVAE(pl.LightningModule):
     def __init__(
         self,
         in_channels: int = 1,
-        codebook_size: int = 128,         # K
-        latent_dim: int = 2,  # 8,  # 16         # dimension of z
+        codebook_size: int = 256,         # K
+        latent_dim: int = 8,  # 8,  # 16         # dimension of z
         commit_loss_weight: float = 0.25,  # 1.0,  # beta
-        lr: float = 1e-4,
+        lr: float = 5e-4,
         activation: ActivationFunc = 'mish',
         width_scale: int = 16,  # 8,  # influences width of convolutional layers
         vector_quantizer_strength: float = 1.0,
@@ -239,7 +220,7 @@ class VQVAE(pl.LightningModule):
             e_x = self.encode(x)
             return e_x
         elif latent_type == 'decoder_input':
-            output = self(x)
+            output = self.model.forward(x)
             return output['decoder_input']
         else:
             raise ValueError(f'Invalid {latent_type=}')
@@ -263,7 +244,9 @@ class VQVAE(pl.LightningModule):
         return loss, metrics
 
     def training_step(self, batch, _batch_idx):
-        loss, _metrics = self._step(batch)
+        loss, metrics = self._step(batch)
+        train_metrics = keymap('train/'.__add__, metrics)
+        self.log_dict(train_metrics)
         return loss
 
     def validation_step(self, batch, _batch_idx):

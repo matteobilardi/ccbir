@@ -1,5 +1,4 @@
 from functools import partial
-
 from torch import default_generator
 from ccbir.data.morphomnist.datamodule import MorphoMNISTDataModule
 from ccbir.data.util import BatchDict, InterleaveDataset, random_split_repeated
@@ -10,7 +9,6 @@ from ccbir.data.morphomnist.dataset import (
 )
 from torchvision import transforms
 from typing import Callable, Generator, Tuple, Type
-import toolz.curried as C
 from torch.utils.data import Subset
 
 
@@ -62,7 +60,7 @@ class VQVAEMorphoMNISTDataModule(MorphoMNISTDataModule):
         self,
         *,
         dataset_type: Type[MorphoMNIST] = VQVAEDataset,
-        batch_size: int = 64,
+        batch_size: int = 256,
         pin_memory: bool = True,
         **kwargs,
     ):

@@ -121,7 +121,7 @@ def random_split_repeated(
 
     If we split naively via torch random_split, two or more different items
     obtained from augmenting the same original item could occur in both the
-    validation set and in the training set, we should be avoided for fair
+    validation set and in the training set, which should be avoided for fair
     evaluation."""
 
     assert repeats >= 1
