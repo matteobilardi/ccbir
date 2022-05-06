@@ -110,7 +110,7 @@ class PSFTwinNetDataset(Dataset):
             fractured=fractured,
         ))
 
-        psf_items_d = psf_items.dict()
+        psf_items_d = psf_items.dict
 
         swelling_data = psf_items_d['swollen']['perturbation_data']
         fracture_data = psf_items_d['fractured']['perturbation_data']

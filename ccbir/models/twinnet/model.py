@@ -4,7 +4,6 @@ import pyro
 import pyro.optim
 import pyro.infer
 from pyro.distributions import Normal, Categorical
-from ccbir.arch import PreActResBlock
 from ccbir.models.twinnet.arch import (
     DeepTwinNet,
     DeepTwinNetNoiseEncoder,
@@ -92,7 +91,7 @@ class TwinNet(pl.LightningModule):
         vqvae: VQVAE,
         weight_sharing: bool = False,
         activation: ActivationFunc = 'mish',
-        batch_norm: bool = False,
+        batch_norm: bool = False, # TODO remove
     ):
         super().__init__()
         kwargs = dict(

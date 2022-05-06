@@ -134,7 +134,7 @@ class DeepTwinNet(nn.Module):
             dim=-1,
         )
 
-        # pyro/pytorch distribution like the index in the probability vector
+        # pyro/pytorch distribution likes the index in the probability vector
         # to be on the last dimension but softmax2d was applied to the
         # channel dimentsion so make channel dimension the last one
         factual_outcome = self.predict_y(factual_input).permute(0, 2, 3, 1)
@@ -170,7 +170,6 @@ class DeepTwinNetNoiseEncoder(nn.Module):
             use_se=True,
         )
 
-        YD = outcome_shape.numel()
         YC = outcome_shape[0]  # channels outcome
         input_channels = 2 * YC  # factual + counterfactual feature map
         if include_non_descendants:

@@ -1,3 +1,8 @@
+from xml.etree.ElementInclude import include
+from ccbir.util import leaves_map, maybe_unbatched_apply
+from ccbir.experiment.util import plot_tsne, show_tensor
+from ccbir.inference.engine import SwollenFracturedMorphoMNISTEngine
+from ccbir.experiment.data import TwinNetExperimentData, VQVAEExperimentData
 from ccbir.models.twinnet.data import PSFTwinNetDataModule, PSFTwinNetDataset
 from ccbir.models.twinnet.model import PSFTwinNet
 from ccbir.models.twinnet.train import vqvae_embed_image
@@ -5,9 +10,7 @@ from ccbir.models.vqvae.data import VQVAEMorphoMNISTDataModule
 from ccbir.models.vqvae.model import VQVAE
 from functools import cached_property, partial
 from more_itertools import interleave
-from sklearn.manifold import TSNE
 from torch import Tensor
-from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from toolz import first
 from torchvision.utils import make_grid
@@ -15,157 +18,15 @@ from typing import Callable, Dict, List, Literal, Optional, Type, Union
 import matplotlib.pyplot as plt
 import pandas as pd
 import pytorch_lightning as pl
-import seaborn as sns
 import torch
 
 # TODO: rename file
 
 
-def pil_from_tensor(tensor):
-    return transforms.ToPILImage()(tensor)
-
-
-def tensor_from_pil(img):
-    return transforms.ToTensor()(img)
-
-
-def show_tensor(tensor_img, dpi=150):
-    plt.figure(dpi=dpi)
-    plt.imshow(pil_from_tensor(tensor_img), cmap='gray', vmin=0, vmax=255)
-
-
-def _plot_tsne(
-    latents_for_perturbation: Dict[
-        Literal['plain', 'swollen', 'fractured'],
-        Tensor,
-    ],
-    labels: Tensor,
-    perplexity: int = 30,
-    n_iter: int = 1000,
-):
-    perturbations = sorted(latents_for_perturbation.keys())
-    assert len(perturbations) > 0
-    latents_all = torch.cat([
-        latents_for_perturbation[p] for p in perturbations
-    ])
-    print('Computing TSNE...')
-    tsne = TSNE(perplexity=perplexity, n_jobs=-1)
-    latents_embedded_all = torch.as_tensor(tsne.fit_transform(
-        # latents need to be flattened to vectors to be processed by TSNE
-        # in case they are not already flat
-        latents_all.flatten(start_dim=1).detach().numpy()
-    ))
-
-    latents_embedded_for_perturbation = dict(zip(
-        perturbations,
-        torch.chunk(latents_embedded_all, len(perturbations)),
-    ))
-
-    df = pd.concat((
-        pd.DataFrame(dict(
-            perturbation=[perturbation] * len(latents_embedded),
-            digit=labels,
-            x=latents_embedded[:, 0],
-            y=latents_embedded[:, 1],
-        ))
-        for perturbation, latents_embedded in
-        latents_embedded_for_perturbation.items()
-    ))
-
-    df = df.sort_values(by=['digit', 'perturbation'])
-
-    plt.figure(dpi=200)
-    # sns.set_style('white')
-    g = sns.scatterplot(
-        data=df,
-        x='x',
-        y='y',
-        hue='digit',
-        style='perturbation',
-        legend='full',
-        palette='bright',
-    )
-    g.legend(loc='center left', bbox_to_anchor=(1, 0.5))
-    g.set(title=f"TSNE: {perplexity=}, {n_iter=}")
-
-
-class ExperimentData:
-    """Provides convenient and fast access to the exact data used by a
-    datamodule"""
-
-    def __init__(
-        self,
-        datamodule_ctor: Union[
-            Type[pl.LightningDataModule],
-            Callable[..., pl.LightningDataModule],
-        ],
-    ):
-        self.datamodule_ctor = datamodule_ctor
-
-    @cached_property
-    def datamodule(self) -> pl.LightningDataModule:
-        print('Loading datamodule...')
-        dm = self.datamodule_ctor()
-        dm.prepare_data()
-        dm.setup()
-
-        return dm
-
-    @cached_property
-    def _train_dataset(self):
-        dm = self.datamodule
-        dataset = dm.train_dataloader().dataset
-        return dataset
-
-    @cached_property
-    def _test_dataset(self):
-        dm = self.datamodule
-        dataset = dm.test_dataloader().dataset
-        return dataset
-
-    def dataset(self, train: bool) -> Dataset:
-        return self._train_dataset if train else self._test_dataset
-
-    def dataloader(self, train: bool):
-        if train:
-            return self.datamodule.train_dataloader()
-        else:
-            return self.datamodule.test_dataloader()
-
-
-class VQVAEExperimentData(ExperimentData):
-    def __init__(self):
-        super().__init__(VQVAEMorphoMNISTDataModule)
-
-
-class TwinNetExperimentData(ExperimentData):
-    def __init__(self, embed_image):
-        super().__init__(
-            datamodule_ctor=partial(
-                PSFTwinNetDataModule,
-                embed_image=embed_image,
-                num_workers=1,
-            )
-        )
-
-    def psf_items(self, train: bool, index: Optional[int] = None) -> Dict:
-        # ugly accesses to train subset dataset
-        dataset = self.dataset(train)
-        if index is None:
-            return (
-                dataset.dataset.psf_items[dataset.indices] if train else
-                dataset.psf_items.dict()
-            )
-        else:
-            return (
-                dataset.dataset.psf_items[dataset.indices[index]] if train else
-                dataset.psf_items[index]
-            )
-
-
 class VQVAEExperiment:
     def __init__(self, vqvae: VQVAE):
         self.vqvae = vqvae
+        self.device = vqvae.device
         self.data = VQVAEExperimentData()
 
         # TODO: hacky - this should not be needed in VQVAE experiments
@@ -180,6 +41,7 @@ class VQVAEExperiment:
         dpi: int = 200,
     ):
         images = first(self.data.dataloader(train))[:num_images]
+        images = images.to(self.device)
 
         with torch.no_grad():
             recons, _z_e, _z_q = self.vqvae(images)
@@ -195,8 +57,8 @@ class VQVAEExperiment:
 
     def _vqvae_z_q(self, x: Tensor) -> Tensor:
         with torch.no_grad():
-            _x_hat, _z_e_x, z_q_x = self.vqvae(x)
-            return z_q_x
+            _x_hat, _z_e_x, z_q_x = self.vqvae(x.to(self.device))
+            return z_q_x.to(x.device)
 
     # TODO: use perturbation types instead of literals
 
@@ -219,7 +81,7 @@ class VQVAEExperiment:
 
         labels = psf_items['plain']['label']
 
-        _plot_tsne(latents_for_perturbation, labels, perplexity, n_iter)
+        plot_tsne(latents_for_perturbation, labels, perplexity, n_iter)
 
 
 class PSFTwinNetExperiment:
@@ -228,10 +90,16 @@ class PSFTwinNetExperiment:
         vqvae: VQVAE,
         twinnet: PSFTwinNet,
     ):
+        assert vqvae.device == twinnet.device
+        self.device = vqvae.device
         self.vqvae = vqvae
         self.twinnet = twinnet
         self.data = TwinNetExperimentData(
             embed_image=partial(vqvae_embed_image, vqvae),
+        )
+        self.infer_engine = SwollenFracturedMorphoMNISTEngine(
+            vqvae=vqvae,
+            twinnet=twinnet,
         )
 
     def vqvae_recon(self, z_e_x: Tensor) -> Tensor:
@@ -240,16 +108,149 @@ class PSFTwinNetExperiment:
         the learned codebook"""
 
         with torch.no_grad():
-            _, e_x, _ = self.vqvae.model.vq(z_e_x)
+            _, e_x, _ = self.vqvae.model.vq(z_e_x.to(self.device))
             x_recon = self.vqvae.decode(e_x)
 
-        return x_recon
+        return x_recon.to(z_e_x.device)
+
+    def encode(self, image: Tensor) -> Tensor:
+        with torch.no_grad():
+            return maybe_unbatched_apply(self.vqvae.encode, image)
+
+    def decode(self, latent: Tensor) -> Tensor:
+        with torch.no_grad():
+            return maybe_unbatched_apply(
+                self.vqvae.decode,
+                latent,
+                single_item_dims=2,
+            )
+
+    def prepare_query(
+        self,
+        item_idx: int,
+        train: bool,
+        condition_on_factual_outcome: bool,
+        include_metadata: bool,
+        include_ground_truth_strip: bool,
+    ) -> Dict:
+        dataset = self.data.dataset(train)
+        X, _y = dataset[item_idx]
+        psf_item = self.data.psf_items(train, item_idx)
+        swollen_image = psf_item['swollen']['image']
+        if include_ground_truth_strip:
+            assert include_metadata
+
+        swollen_embedding = self.encode(swollen_image)
+
+        if include_metadata:
+            original_image = psf_item['plain']['image']
+            fractured_image = psf_item['fractured']['image']
+            fractured_embedding = self.encode(fractured_image)
+            metadata = dict(
+                original_image=original_image,
+                swollen_image=swollen_image,
+                swollen_embedding=swollen_embedding,
+                fractured_image=fractured_image,
+                fractured_embedding=fractured_embedding,
+            )
+
+            if include_ground_truth_strip:
+                ground_truths = torch.stack((
+                    original_image,
+                    swollen_image,
+                    self.decode(swollen_embedding),
+                    fractured_image,
+                    self.decode(fractured_embedding),
+                ))
+
+                ground_truth_strip = make_grid(
+                    tensor=ground_truths,
+                    normalize=True,
+                    value_range=(-1, 1)
+                )
+                metadata['ground_truth_strip'] = ground_truth_strip
+
+        X = leaves_map(lambda t: t.to(self.device), X)
+        query = dict(
+            treatments=dict(
+                swell=X['factual_treatment'],
+                fracture=X['counterfactual_treatment'],
+            ),
+            confounders=X['confounders'],
+        )
+        if condition_on_factual_outcome:
+            query['observed_factual_outcomes'] = dict(
+                swell=swollen_embedding
+            )
+
+        return query, metadata
+
+    def benchmark_generative_model(self):
+        pass
 
     def show_twinnet_samples(
         self,
         item_idx: int,
         num_samples=32,
-        noise_scale: float = 0.25,
+        noise_scale: float = 1,
+        condition_on_factual_outcome: bool = False,
+        top_k: Optional[int] = None,
+        train=False,
+        dpi=300,
+    ):
+        assert (
+            (not condition_on_factual_outcome and top_k is None) or
+            (condition_on_factual_outcome and top_k is not None)
+        )
+        query, metadata = self.prepare_query(
+            item_idx=item_idx,
+            train=train,
+            condition_on_factual_outcome=condition_on_factual_outcome,
+            include_metadata=True,
+            include_ground_truth_strip=True,
+        )
+
+        if condition_on_factual_outcome:
+            outcomes = self.infer_engine.infer_outcomes(
+                **query,
+                num_samples=num_samples,
+                noise_scale=noise_scale,
+                top_k=top_k,
+            )
+        else:
+            outcomes = self.infer_engine.sample_outcomes(
+                **query,
+                num_samples=num_samples,
+                noise_scale=noise_scale,
+            )
+
+        swollen_embedding_hat = outcomes.dict['swell']
+        fractured_embedding_hat = outcomes.dict['fracture']
+
+        # make the swollen and fractured embedding sampled from the same input
+        # and noise show up one after the other to ease visual inspection
+        paired_up_embeddings = torch.stack(list(
+            interleave(swollen_embedding_hat, fractured_embedding_hat)
+        ))
+
+        # paired up images sampled via the twinnet
+        images_hat = self.decode(paired_up_embeddings)
+
+        show_tensor(metadata['ground_truth_strip'])
+        show_tensor(
+            make_grid(
+                tensor=images_hat,
+                normalize=True,
+                value_range=(-1, 1),
+            ),
+            dpi=dpi,
+        )
+
+    def _show_twinnet_samples(
+        self,
+        item_idx: int,
+        num_samples=32,
+        noise_scale: float = 1.0,
         train=False,
         dpi=300,
     ):
@@ -285,12 +286,6 @@ class PSFTwinNetExperiment:
             for k, v in X.items()
         }
 
-        # resample noise, possibly with differen scale for higher/lower
-        # variance
-        # X['outcome_noise'] = PSFTwinNetDataset.sample_outcome_noise(
-        #    sample_shape=X['outcome_noise'].shape,
-        #    scale=noise_scale,
-        # )
         X['outcome_noise'] = noise_scale * torch.randn(
             (num_samples, self.twinnet.outcome_noise_dim),
         )
@@ -344,4 +339,4 @@ class PSFTwinNetExperiment:
         psf_items = self.data.psf_items(train, slice(num_points))
         labels = psf_items['plain']['label']
 
-        _plot_tsne(latents_for_perturbations, labels, perplexity, n_iter)
+        plot_tsne(latents_for_perturbations, labels, perplexity, n_iter)

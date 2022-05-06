@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from vector_quantize_pytorch import VectorQuantize
 from toolz import keymap
+import numpy as np
 
 
 class VectorQuantizer(VectorQuantize):
@@ -18,7 +19,7 @@ class VectorQuantizer(VectorQuantize):
         codebook_size,
         n_embed=None,
         codebook_dim=None,
-        decay=0.8,
+        decay=0.99,
         eps=0.00001,
         kmeans_init=False,
         kmeans_iters=10,
@@ -53,7 +54,7 @@ class VectorQuantizer(VectorQuantize):
             orthogonal_reg_active_codes_only,
             orthogonal_reg_max_codes,
             sample_codebook_temp,
-            sync_codebook
+            sync_codebook,
         )
 
     def quantize_encoding(
@@ -127,7 +128,7 @@ class VQVAEComponent(nn.Module):
 
     def encode(self, x: Tensor):
         z_e = self.encoder(x)
-        _z_q, e, = self.vq(z_e)
+        _z_q, e, _loss = self.vq(z_e)
         return e
 
     def decode(self, discrete_latent: Tensor):
@@ -208,6 +209,7 @@ class VQVAE(pl.LightningModule):
     def decode(self, e_x):
         return self.model.decode(e_x)
 
+    # TODO: equivalent decoding method
     def embed(
         self,
         x: Tensor,

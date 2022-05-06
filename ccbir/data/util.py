@@ -37,14 +37,15 @@ class BatchDict:
     def __len__(self) -> int:
         return self._len
 
-    def __getitem__(self, index) -> Dict:
-        return leaves_map(C.get(index), self.dict())
+    def __getitem__(self, index) -> BatchDictLike:
+        return leaves_map(C.get(index), self.dict)
 
+    @property
     def dict(self) -> Dict:
         return self._dict
 
     def map(self, func: Callable[[BatchDictLike], BatchDictLike]) -> Self:
-        return self.__class__(func(self.dict()))
+        return self.__class__(func(self.dict))
 
     def map_features(self, func: Callable[[Sequence], Sequence]) -> Self:
         return self.map(leaves_map(func))
