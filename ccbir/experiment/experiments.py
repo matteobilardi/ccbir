@@ -1,28 +1,36 @@
-from collections import defaultdict
-import math
-import operator
-import pprint
-from torchmetrics.functional import structural_similarity_index_measure as ssim
-from tqdm import tqdm
-from zmq import device
-from ccbir.util import leaves_map, maybe_unbatched_apply, star_apply
-from ccbir.experiment.util import plot_tsne, show_tensor
-from ccbir.inference.engine import SwollenFracturedMorphoMNIST_Engine
+from ccbir.data.morphomnist.dataset import (
+    FracturedMorphoMNIST,
+    SwollenMorphoMNIST
+)
+from ccbir.data.util import BatchDict
 from ccbir.experiment.data import TwinNetExperimentData, VQVAEExperimentData
+from ccbir.experiment.util import ndcg, plot_tsne, show_tensor
+from ccbir.inference.engine import SwollenFracturedMorphoMNIST_Engine
 from ccbir.models.twinnet.model import PSFTwinNet
 from ccbir.models.twinnet.train import vqvae_embed_image
 from ccbir.models.vqvae.model import VQVAE
+from ccbir.retrieval.cbir import (
+    CBIR_Pipeline,
+    SSIM_CBIR_Pipeline,
+    VQVAE_CBIR_Pipeline,
+)
+from ccbir.retrieval.ccbir import CCBIR_Pipeline
+from ccbir.util import leaves_map, maybe_unbatched_apply, star_apply
 from functools import partial
 from more_itertools import interleave
-from torch import Tensor
-from torchvision import transforms
 from toolz import first, merge_with, valmap, compose
-import toolz.curried as C
+from torch import Tensor
+from torchmetrics.functional import (
+    structural_similarity_index_measure as ssim,
+)
+from torchvision import transforms
 from torchvision.utils import make_grid
+from tqdm import tqdm
 from typing import Callable, Dict, List, Literal, Optional, Type, Union
 import matplotlib.pyplot as plt
 import pandas as pd
 import pytorch_lightning as pl
+import toolz.curried as C
 import torch
 
 
@@ -227,13 +235,13 @@ class PSFTwinNetExperiment:
             outcome_ = valmap(partial(Tensor.squeeze, dim=0), outcomes_)
             fake_vqvae_img = valmap(self.decode, outcome_)
 
-            outcomes_distance = compose(
+            _outcomes_distance = star_apply(compose(
                 Tensor.item,
-                star_apply(self.infer_engine.outcomes_distance),
-            )
+                self.infer_engine.outcomes_distance,
+            ))
 
             # MSE between observed discrete latents and reconstructed latents
-            embedding_mse = merge_with(outcomes_distance, outcome_, outcome)
+            embedding_mse = merge_with(_outcomes_distance, outcome_, outcome)
             # cosine similarity between observed discrete latents and
             # reconstructed latents
             embedding_cosine_similarity = valmap(
@@ -274,9 +282,6 @@ class PSFTwinNetExperiment:
         )
 
         return avg_metrics
-
-    def benchmark_retrieval(self) -> Dict:
-        pass
 
     def show_twinnet_samples(
         self,
@@ -359,3 +364,105 @@ class PSFTwinNetExperiment:
         labels = psf_items['plain']['label']
 
         plot_tsne(latents_for_perturbations, labels, perplexity, n_iter)
+
+
+class RetrievalExperiment:
+    def __init__(
+        self,
+        vqvae: VQVAE,
+        twinnet: PSFTwinNet,
+        train_datasets: bool = False,
+        num_images: int = -1,  # include all images by default
+    ):
+        assert vqvae.device == twinnet.device
+        self.device = vqvae.device
+
+        normalize = transforms.Normalize(mean=0.5, std=0.5)
+        kwargs = dict(
+            train=train_datasets,
+            transform=partial(
+                BatchDict.map,
+                func=lambda item: dict(image=normalize(item['image'])),
+            ),
+        )
+
+        print('Loading datasets')
+        datasets = dict(
+            swell=SwollenMorphoMNIST(**kwargs),
+            fracture=FracturedMorphoMNIST(**kwargs),
+        )
+        print('Loaded datasets')
+
+        self.images = valmap(
+            lambda d: d[:num_images]['image'].to(self.device),
+            datasets,
+        )
+        self.ground_truth_cbir_pipelines: Dict[str, CBIR_Pipeline] = (
+            valmap(SSIM_CBIR_Pipeline, self.images)
+        )
+        self.cbir_pipelines: Dict[str, CBIR_Pipeline] = (
+            valmap(partial(VQVAE_CBIR_Pipeline, vqvae=vqvae), self.images)
+        )
+        self.ccbir_pipeline = CCBIR_Pipeline(
+            inference_engine=SwollenFracturedMorphoMNIST_Engine(
+                vqvae=vqvae,
+                twinnet=twinnet,
+            ),
+            cbir_for_treatment_type=self.cbir_pipelines,
+        )
+
+    def _benchmark_cbir_pipeline(
+        self,
+        query_images: Tensor,
+        cbir: CBIR_Pipeline,
+        ground_truth_cbir: CBIR_Pipeline,
+    ) -> Dict:
+        cumulative_metrics = dict()
+        for image in tqdm(query_images):
+            _, pred_idxs = cbir.find_closest(image, top_k=None)
+            target_images, target_idxs = (
+                ground_truth_cbir.find_closest(image, top_k=None)
+            )
+            assert torch.allclose(image, target_images[0])
+
+            relevant_result = target_idxs[0].item()
+
+            def hit_rate_at_k(k: int) -> float:
+                return float(relevant_result in pred_idxs[:k])
+
+            rank = (pred_idxs == relevant_result).nonzero().item()
+            reciprocal_rank = 1 / (1 + rank)
+
+            metrics = dict(
+                ndcg=ndcg(pred_idxs, target_idxs),
+                hit_rate_at_1=hit_rate_at_k(1),
+                hit_rate_at_5=hit_rate_at_k(5),
+                reciprocal_rank=reciprocal_rank,
+            )
+
+            cumulative_metrics = merge_with(sum, cumulative_metrics, metrics)
+
+        avg_metrics = valmap(
+            lambda x: x / len(query_images),
+            cumulative_metrics,
+        )
+
+        return avg_metrics
+
+    def benchmark_cbir_vqvae(
+        self,
+        num_queries: int = 128,
+    ) -> Dict:
+        query_images = valmap(lambda imgs: imgs[:num_queries], self.images)
+        results = merge_with(
+            star_apply(self._benchmark_cbir_pipeline),
+            query_images,
+            self.cbir_pipelines,
+            self.ground_truth_cbir_pipelines,
+        )
+
+        return results
+
+    def benchmark_ccbir(self):
+        # TODO
+        raise NotImplementedError

@@ -1,7 +1,8 @@
 from sklearn.manifold import TSNE
-from torch import Tensor
+from torch import LongTensor, Tensor
+from torchmetrics.functional import retrieval_normalized_dcg
 from torchvision import transforms
-from typing import Dict, Literal
+from typing import Dict, Iterable, Literal, Optional
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
@@ -74,3 +75,26 @@ def plot_tsne(
     )
     g.legend(loc='center left', bbox_to_anchor=(1, 0.5))
     g.set(title=f"TSNE: {perplexity=}, {n_iter=}")
+
+
+def ndcg(pred_idxs: LongTensor, target_idxs: LongTensor) -> float:
+    assert len(pred_idxs) == len(target_idxs)
+    num_results = len(pred_idxs)
+    relevance_scores = torch.arange(
+        start=num_results - 1,
+        end=-1,
+        step=-1,
+        dtype=torch.float32,
+    )
+
+    # TODO: there might be a cleaner way than explicit allocation
+    pred_relevance = torch.full((num_results,), -1.0)
+    pred_relevance[pred_idxs] = relevance_scores
+    target_relevance = torch.full((num_results,), -1.0)
+    target_relevance[target_idxs] = relevance_scores
+    assert torch.all(pred_relevance >= 0)
+    assert torch.all(target_relevance >= 0)
+
+    ndgc_ = retrieval_normalized_dcg(pred_relevance, target_relevance)
+
+    return ndgc_.item()
