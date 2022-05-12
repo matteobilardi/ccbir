@@ -100,6 +100,7 @@ class Config:
         ]
         sys.path.extend(map(str, paths))
         os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+        #os.environ['LD_LIBRARY_PATH'] = '/vol/cuda/11.3.1-cudnn8.2.1/lib64/'
         os.environ['LD_LIBRARY_PATH'] = '/vol/cuda/11.4.120-cudnn8.2.4/lib64'
 
 

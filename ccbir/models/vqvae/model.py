@@ -1,15 +1,14 @@
-from einops import rearrange
+from einops import rearrange, reduce
 from ccbir.arch import PreActResBlock
 from ccbir.util import ActivationFunc, activation_layer_ctor
-from functools import partial
+from functools import cached_property, partial
 import pytorch_lightning as pl
-from torch import Tensor, nn
+from torch import LongTensor, Tensor, nn
 from typing import Callable, Literal
 import torch
 import torch.nn.functional as F
 from vector_quantize_pytorch import VectorQuantize
 from toolz import keymap
-import numpy as np
 
 
 class VectorQuantizer(VectorQuantize):
@@ -68,6 +67,31 @@ class VectorQuantizer(VectorQuantize):
             quantized = rearrange(quantized, 'b (h w) c -> b c h w', h=h, w=w)
 
         return quantized
+
+    @cached_property
+    def _distance_matrix(self) -> Tensor:
+        codewords = self.codebook.unsqueeze(0)
+        print('Pre-computing codebook distances')
+        distances = torch.cdist(codewords, codewords, p=2).squeeze(0)
+        print('Precomputed codebook distances')
+
+        return distances
+
+    def latents_distance(
+        self,
+        latent1: Tensor,  # B x *
+        latent2: Tensor,  # B x *
+    ) -> Tensor:  # B
+        """Distance between discrete latents (of size B x *) computed as the MSE
+        between the corresponding quantized tensors (of size B x * x D)"""
+        assert latent1.shape == latent2.shape
+        flatten = partial(rearrange, pattern='b ... -> b (...)')
+        idxs1 = flatten(latent1)
+        idxs2 = flatten(latent2)
+        distances = self._distance_matrix[idxs1, idxs2]
+        distance = reduce(distances, 'b n -> b', 'mean')
+
+        return distance
 
 
 class VQVAEComponent(nn.Module):
@@ -190,6 +214,10 @@ class VQVAE(pl.LightningModule):
             commitment_cost=commit_loss_weight,
         )
 
+    @property
+    def vq(self) -> VectorQuantizer:
+        return self.model.vq
+
     def forward(self, x):
         output = self.model.forward(x)
         x_recon = output['recon']
@@ -201,7 +229,7 @@ class VQVAE(pl.LightningModule):
         """Discrete latent embedding e_x"""
         return self.model.encode(x)
 
-    def encoder_net(self, x):
+    def encoder_net(self, x):  # TODO: remove
         """(continuous) encoder network output z_e_x i.e. before generating
         discrete embedding via the codebook"""
         return self.model.encoder(x)
@@ -209,7 +237,7 @@ class VQVAE(pl.LightningModule):
     def decode(self, e_x):
         return self.model.decode(e_x)
 
-    # TODO: equivalent decoding method
+    # TODO: write equivalent decoding method
     def embed(
         self,
         x: Tensor,

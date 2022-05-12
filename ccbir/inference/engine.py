@@ -1,5 +1,4 @@
 from abc import ABC, abstractmethod
-from turtle import distance
 from ccbir.models.util import load_best_model
 from ccbir.models.vqvae.model import VQVAE
 from ccbir.data.util import BatchDict
@@ -48,13 +47,13 @@ class InferenceEngine(ABC):
             observed_factual_outcomes.__contains__,
             sampled_outcomes.dict,
         )
-        distance_by_factual_outcome: Dict[str, Tensor] = merge_with(
+        distance_from_factual_outcome: Dict[str, Tensor] = merge_with(
             star_apply(self.outcomes_distance),
             sampled_factual_outcomes,
             observed_factual_outcomes,
         )
         distance = (
-            torch.stack(list(distance_by_factual_outcome.values()))
+            torch.stack(list(distance_from_factual_outcome.values()))
             .mean(dim=0)
         )
 
@@ -94,43 +93,34 @@ class InferenceEngine(ABC):
         )
 
 
-class VQVAETwinnetEngine(InferenceEngine):
+class VQVAE_Engine(InferenceEngine):
     def __init__(
         self,
         vqvae: VQVAE,
-        twinnet: TwinNet,
     ):
         super().__init__()
         self.vqvae = vqvae
-        self.twinnet = twinnet
-
-    @cached_property
-    def _distance_matrix(self):
-        # 1 X K X D
-        codewords = self.vqvae.model.vq.codebook.unsqueeze(0)
-        print('Pre-computing codebook distances')
-        distances = torch.cdist(codewords, codewords, p=2).squeeze(0)
-        print('Precomputed codebook distances')
-
-        return distances
 
     def outcomes_distance(
         self,
         outcome_samples: Tensor,
         outcome_target: Tensor,
     ) -> Tensor:
+        if outcome_samples.dim() == 2:
+            outcome_samples = outcome_samples.unsqueeze(0)
+
         assert outcome_samples.dim() == outcome_target.dim() + 1
         num_samples = outcome_samples.shape[0]
-        codewords_distance = self._distance_matrix
-        samples_idxs = rearrange(outcome_samples, 's h w -> s (h w)')
-        targets_idxs = repeat(outcome_target, 'h w -> s (h w)', s=num_samples)
-        distances = codewords_distance[samples_idxs, targets_idxs]
-        distance = distances.sum(dim=1)
+        outcome_targets = repeat(
+            tensor=outcome_target,
+            pattern='h w -> s h w',
+            s=num_samples,
+        )
 
-        return distance
+        return self.vqvae.vq.latents_distance(outcome_samples, outcome_targets)
 
 
-class SwollenFracturedMorphoMNISTEngine(VQVAETwinnetEngine):
+class SwollenFracturedMorphoMNIST_Engine(VQVAE_Engine):
     def __init__(
         self,
         vqvae: Optional[VQVAE] = None,
@@ -140,7 +130,9 @@ class SwollenFracturedMorphoMNISTEngine(VQVAETwinnetEngine):
             twinnet = load_best_model(PSFTwinNet)
         if vqvae is None:
             vqvae = twinnet.vqvae
-        super().__init__(vqvae, twinnet)
+        
+        super().__init__(vqvae)
+        self.twinnet = twinnet
 
     def sample_outcomes(
         self,
@@ -157,9 +149,8 @@ class SwollenFracturedMorphoMNISTEngine(VQVAETwinnetEngine):
         x = repeat_num_samples(treatments['swell'])
         x_star = repeat_num_samples(treatments['fracture'])
         z = repeat_num_samples(confounders)
-        noise_dim = self.twinnet.outcome_noise_dim
         u_y = noise_scale * torch.randn(
-            size=(num_samples, noise_dim),
+            size=(num_samples, self.twinnet.outcome_noise_dim),
             device=x.device,
         )
         input = dict(

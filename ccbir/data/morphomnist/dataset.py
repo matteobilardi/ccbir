@@ -129,7 +129,7 @@ class MorphoMNIST(Dataset):
         return self.items
 
     def __len__(self) -> int:
-        return len(self.images)
+        return len(self.items)
 
     def __getitem__(self, index):
         return self.items[index]

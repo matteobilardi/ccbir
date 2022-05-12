@@ -1,26 +1,29 @@
-from xml.etree.ElementInclude import include
-from ccbir.util import leaves_map, maybe_unbatched_apply
+from collections import defaultdict
+import math
+import operator
+import pprint
+from torchmetrics.functional import structural_similarity_index_measure as ssim
+from tqdm import tqdm
+from zmq import device
+from ccbir.util import leaves_map, maybe_unbatched_apply, star_apply
 from ccbir.experiment.util import plot_tsne, show_tensor
-from ccbir.inference.engine import SwollenFracturedMorphoMNISTEngine
+from ccbir.inference.engine import SwollenFracturedMorphoMNIST_Engine
 from ccbir.experiment.data import TwinNetExperimentData, VQVAEExperimentData
-from ccbir.models.twinnet.data import PSFTwinNetDataModule, PSFTwinNetDataset
 from ccbir.models.twinnet.model import PSFTwinNet
 from ccbir.models.twinnet.train import vqvae_embed_image
-from ccbir.models.vqvae.data import VQVAEMorphoMNISTDataModule
 from ccbir.models.vqvae.model import VQVAE
-from functools import cached_property, partial
+from functools import partial
 from more_itertools import interleave
 from torch import Tensor
 from torchvision import transforms
-from toolz import first
+from toolz import first, merge_with, valmap, compose
+import toolz.curried as C
 from torchvision.utils import make_grid
 from typing import Callable, Dict, List, Literal, Optional, Type, Union
 import matplotlib.pyplot as plt
 import pandas as pd
 import pytorch_lightning as pl
 import torch
-
-# TODO: rename file
 
 
 class VQVAEExperiment:
@@ -97,33 +100,33 @@ class PSFTwinNetExperiment:
         self.data = TwinNetExperimentData(
             embed_image=partial(vqvae_embed_image, vqvae),
         )
-        self.infer_engine = SwollenFracturedMorphoMNISTEngine(
+        self.infer_engine = SwollenFracturedMorphoMNIST_Engine(
             vqvae=vqvae,
             twinnet=twinnet,
         )
 
-    def vqvae_recon(self, z_e_x: Tensor) -> Tensor:
-        """z_e_x is the encoding of the input produced by the encoder network of
-        the vqvae before it's mapped to the indices of specific codewords via
-        the learned codebook"""
+    def vqvae_recon(self, image: Tensor) -> Tensor:
+        def recon(x: Tensor):
+            with torch.no_grad():
+                x_recon, _, _ = self.vqvae(x.to(self.device))
+                return x_recon.to(x.device)
 
-        with torch.no_grad():
-            _, e_x, _ = self.vqvae.model.vq(z_e_x.to(self.device))
-            x_recon = self.vqvae.decode(e_x)
-
-        return x_recon.to(z_e_x.device)
+        return maybe_unbatched_apply(recon, image)
 
     def encode(self, image: Tensor) -> Tensor:
         with torch.no_grad():
-            return maybe_unbatched_apply(self.vqvae.encode, image)
+            return maybe_unbatched_apply(
+                self.vqvae.encode,
+                image.to(self.device),
+            ).to(image.device)
 
     def decode(self, latent: Tensor) -> Tensor:
         with torch.no_grad():
             return maybe_unbatched_apply(
                 self.vqvae.decode,
-                latent,
+                latent.to(self.device),
                 single_item_dims=2,
-            )
+            ).to(latent.device)
 
     def prepare_query(
         self,
@@ -136,15 +139,15 @@ class PSFTwinNetExperiment:
         dataset = self.data.dataset(train)
         X, _y = dataset[item_idx]
         psf_item = self.data.psf_items(train, item_idx)
-        swollen_image = psf_item['swollen']['image']
+        swollen_image = psf_item['swollen']['image'].to(self.device)
         if include_ground_truth_strip:
             assert include_metadata
 
         swollen_embedding = self.encode(swollen_image)
 
         if include_metadata:
-            original_image = psf_item['plain']['image']
-            fractured_image = psf_item['fractured']['image']
+            original_image = psf_item['plain']['image'].to(self.device)
+            fractured_image = psf_item['fractured']['image'].to(self.device)
             fractured_embedding = self.encode(fractured_image)
             metadata = dict(
                 original_image=original_image,
@@ -170,7 +173,7 @@ class PSFTwinNetExperiment:
                 )
                 metadata['ground_truth_strip'] = ground_truth_strip
 
-        X = leaves_map(lambda t: t.to(self.device), X)
+        X = leaves_map(partial(Tensor.to, device=self.device), X)
         query = dict(
             treatments=dict(
                 swell=X['factual_treatment'],
@@ -185,7 +188,94 @@ class PSFTwinNetExperiment:
 
         return query, metadata
 
-    def benchmark_generative_model(self):
+    @torch.no_grad()
+    def benchmark_generative_model(
+        self,
+        num_samples: int = 1024,
+        noise_scale: float = 1.0,
+        max_items: int = 20000,
+    ) -> Dict:
+        prepare_query = partial(
+            self.prepare_query,
+            train=False,
+            condition_on_factual_outcome=True,
+            include_metadata=True,
+            include_ground_truth_strip=False,
+        )
+        num_items = min(max_items, len(self.data.dataset(train=False)))
+        item_idxs = range(num_items)
+        queries = map(prepare_query, item_idxs)
+        cumulative_metrics = dict()
+
+        for query, metadata in tqdm(queries, total=num_items):
+            outcomes_ = self.infer_engine.infer_outcomes(
+                **query,
+                num_samples=num_samples,
+                noise_scale=noise_scale,
+                top_k=1,
+            ).dict
+
+            original_img = dict(
+                swell=metadata['swollen_image'],
+                fracture=metadata['fractured_image'],
+            )
+            outcome = dict(
+                swell=metadata['swollen_embedding'],
+                fracture=metadata['fractured_embedding'],
+            )
+            original_vqvae_img = valmap(self.decode, outcome)
+            outcome_ = valmap(partial(Tensor.squeeze, dim=0), outcomes_)
+            fake_vqvae_img = valmap(self.decode, outcome_)
+
+            outcomes_distance = compose(
+                Tensor.item,
+                star_apply(self.infer_engine.outcomes_distance),
+            )
+
+            # MSE between observed discrete latents and reconstructed latents
+            embedding_mse = merge_with(outcomes_distance, outcome_, outcome)
+            # cosine similarity between observed discrete latents and
+            # reconstructed latents
+            embedding_cosine_similarity = valmap(
+                lambda mse: 1 - mse / 2,
+                embedding_mse,
+            )
+
+            def _ssim(args) -> float:
+                [preds, target] = args
+                return ssim(
+                    preds=preds.unsqueeze(0),
+                    target=target.unsqueeze(0),
+                    data_range=2.0,  # 1.0 - (-1.0)
+                ).item()
+
+            ssim_dicts = C.merge_with(_ssim)
+
+            metrics = dict(
+                embedding_mse=embedding_mse,
+                embedding_cosine_similarity=embedding_cosine_similarity,
+                # ssim between original and vqvae reconsturction
+                ssim_orig_vqvae=ssim_dicts(original_vqvae_img, original_img),
+                # ssim between vqvae reconstruction and best sampled outcomes
+                ssim_vqvae_fake=ssim_dicts(fake_vqvae_img, original_vqvae_img),
+                # ssim between original and best sampled outcomes
+                ssim_orig_fake=ssim_dicts(fake_vqvae_img, original_img),
+            )
+
+            cumulative_metrics = merge_with(
+                C.merge_with(sum),
+                cumulative_metrics,
+                metrics,
+            )
+
+        avg_metrics = leaves_map(
+            lambda x: x / len(item_idxs),
+            cumulative_metrics,
+        )
+
+        return avg_metrics
+
+    def benchmark_retrieval(self) -> Dict:
         pass
 
     def show_twinnet_samples(
@@ -237,77 +327,6 @@ class PSFTwinNetExperiment:
         images_hat = self.decode(paired_up_embeddings)
 
         show_tensor(metadata['ground_truth_strip'])
-        show_tensor(
-            make_grid(
-                tensor=images_hat,
-                normalize=True,
-                value_range=(-1, 1),
-            ),
-            dpi=dpi,
-        )
-
-    def _show_twinnet_samples(
-        self,
-        item_idx: int,
-        num_samples=32,
-        noise_scale: float = 1.0,
-        train=False,
-        dpi=300,
-    ):
-        dataset = self.data.dataset(train)
-        X, y = dataset[item_idx]
-        psf_item = self.data.psf_items(train, item_idx)
-        original_image = psf_item['plain']['image'].unsqueeze(0)
-        swollen_image = psf_item['swollen']['image'].unsqueeze(0)
-        fractured_image = psf_item['fractured']['image'].unsqueeze(0)
-        swollen_embedding = y['factual_outcome'].unsqueeze(0)
-        fractured_embedding = (
-            y['counterfactual_outcome'].unsqueeze(0)
-        )
-
-        print(f"{swollen_embedding.shape=}")
-        print(f"{fractured_embedding.shape=}")
-
-        ground_truths = torch.cat((
-            original_image,
-            swollen_image,
-            self.vqvae_recon(swollen_embedding),
-            fractured_image,
-            self.vqvae_recon(fractured_embedding),
-        ))
-
-        # repeat input num_samples time
-        X = {
-            k: (
-                v.unsqueeze(0)
-                .clone()
-                .repeat_interleave(num_samples, dim=0)
-            )
-            for k, v in X.items()
-        }
-
-        X['outcome_noise'] = noise_scale * torch.randn(
-            (num_samples, self.twinnet.outcome_noise_dim),
-        )
-
-        swollen_embedding_hat, fractured_embedding_hat = self.twinnet(X)
-
-        # make the swollen and fractured embedding sampled from the same input
-        # and noise show up one after the other to ease visual inspection
-        paired_up_embeddings = torch.stack(list(
-            interleave(swollen_embedding_hat, fractured_embedding_hat)
-        ))
-
-        # paired up images sampled via the twinnet
-        images_hat = self.vqvae_recon(paired_up_embeddings)
-
-        print('original, swollen, swollen_vqvae, fractured, fractured_vqvae')
-        show_tensor(make_grid(
-            tensor=ground_truths,
-            normalize=True,
-            value_range=(-1, 1)
-        ))
-        print('Twin network outputted swollen-fractured pairs')
         show_tensor(
             make_grid(
                 tensor=images_hat,
