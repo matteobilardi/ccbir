@@ -26,10 +26,8 @@ class DeepTwinNet(nn.Module):
         activation: Callable[..., nn.Module],
     ):
         super().__init__()
-        self.data_dim = treatment_dim + confounders_dim
         self.weight_sharing = weight_sharing
         self.vqvae = vqvae
-        self.input_dim = self.data_dim + outcome_noise_dim
 
         resblocks = partial(
             PreActResBlock.multi_block,
@@ -37,19 +35,31 @@ class DeepTwinNet(nn.Module):
             use_se=True,
         )
 
-        def make_branch():
+        trunk_in_channels = confounders_dim + outcome_noise_dim
+        trunk_out_channels = 16
+        branch_in_channels = trunk_out_channels + treatment_dim
+
+        def make_trunk():
             return nn.Sequential(
                 nn.Unflatten(1, (-1, 1, 1)),
-                nn.Upsample(scale_factor=32, mode='nearest'),
-                nn.Conv2d(self.input_dim, 128, 3, 1, 1, bias=False),
+                nn.Upsample(scale_factor=8, mode='nearest'),
+                nn.Conv2d(trunk_in_channels, 32, 3, 1, 1, bias=False),
                 # num_blocks, in_channels, out_channels, stride
-                resblocks(2, 128, 32),
-                resblocks(2, 32, 32, 2),
-                resblocks(2, 32, 64, 2),
+                resblocks(3, 32, 16),
+                resblocks(1, 16, trunk_out_channels),
+            )
+
+        def make_branch():
+            return nn.Sequential(
+                resblocks(3, branch_in_channels, 32),
+                nn.Conv2d(32, 64, 3, 1, 1, bias=False),
+                nn.BatchNorm2d(64),
+                activation(),
                 nn.Conv2d(64, vqvae.codebook_size, 1),
                 nn.Softmax2d(),
             )
 
+        self.shared_trunk = make_trunk()
         self.predict_y = make_branch()
         self.predict_y_star = (
             self.predict_y if weight_sharing else make_branch()
@@ -117,21 +127,26 @@ class DeepTwinNet(nn.Module):
         confounders: Tensor,
         outcome_noise: Tensor,
     ) -> Tuple[Tensor, Tensor]:
+        shared_input = torch.cat((confounders, outcome_noise), dim=-1)
+        shared_output = self.shared_trunk(shared_input)
+        b, _c, h, w = shared_output.shape
+        factual_treatment_fmap = F.upsample(
+            input=factual_treatment.view(b, -1, 1, 1),
+            size=(h, w),
+            mode='nearest',
+        )
         factual_input = torch.cat(
-            tensors=(
-                factual_treatment,
-                confounders,
-                outcome_noise,
-            ),
-            dim=-1,
+            tensors=(factual_treatment_fmap, shared_output),
+            dim=1,
+        )
+        counterfactual_treatment_fmap = F.upsample(
+            input=counterfactual_treatment.view(b, -1, 1, 1),
+            size=(h, w),
+            mode='nearest',
         )
         counterfactual_input = torch.cat(
-            tensors=(
-                counterfactual_treatment,
-                confounders,
-                outcome_noise,
-            ),
-            dim=-1,
+            tensors=(counterfactual_treatment_fmap, shared_output),
+            dim=1,
         )
 
         # pyro/pytorch distribution likes the index in the probability vector
