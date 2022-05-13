@@ -40,6 +40,9 @@ class BatchDict:
     def __getitem__(self, index) -> BatchDictLike:
         return leaves_map(C.get(index), self.dict)
 
+    def iter_rows(self):
+        return (self[idx] for idx in range(len(self)))
+
     @property
     def dict(self) -> Dict:
         return self._dict
@@ -71,7 +74,7 @@ class BatchDict:
 
     @classmethod
     def zip(cls, batch_dicts: Dict[Any, BatchDict]) -> Self:
-        return cls(valmap(cls.dict, batch_dicts))
+        return cls(valmap(lambda bd: bd.dict, batch_dicts))
 
     @classmethod
     def _get_features_lengths(cls, features: BatchDictLike) -> List[int]:

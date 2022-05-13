@@ -1,10 +1,11 @@
+from matplotlib import image
 from ccbir.data.morphomnist.dataset import (
     FracturedMorphoMNIST,
     SwollenMorphoMNIST
 )
 from ccbir.data.util import BatchDict
 from ccbir.experiment.data import TwinNetExperimentData, VQVAEExperimentData
-from ccbir.experiment.util import ndcg, plot_tsne, show_tensor
+from ccbir.experiment.util import hit_rate, ndcg, plot_tsne, reciprocal_rank, show_tensor
 from ccbir.inference.engine import SwollenFracturedMorphoMNIST_Engine
 from ccbir.models.twinnet.model import PSFTwinNet
 from ccbir.models.twinnet.train import vqvae_embed_image
@@ -19,14 +20,14 @@ from ccbir.util import leaves_map, maybe_unbatched_apply, star_apply
 from functools import partial
 from more_itertools import interleave
 from toolz import first, merge_with, valmap, compose
-from torch import Tensor
+from torch import LongTensor, Tensor
 from torchmetrics.functional import (
     structural_similarity_index_measure as ssim,
 )
 from torchvision import transforms
 from torchvision.utils import make_grid
 from tqdm import tqdm
-from typing import Callable, Dict, List, Literal, Optional, Type, Union
+from typing import Callable, Dict, Iterable, List, Literal, Optional, Type, Union
 import matplotlib.pyplot as plt
 import pandas as pd
 import pytorch_lightning as pl
@@ -384,6 +385,7 @@ class RetrievalExperiment:
                 BatchDict.map,
                 func=lambda item: dict(image=normalize(item['image'])),
             ),
+            repeats=1,
         )
 
         print('Loading datasets')
@@ -391,6 +393,11 @@ class RetrievalExperiment:
             swell=SwollenMorphoMNIST(**kwargs),
             fracture=FracturedMorphoMNIST(**kwargs),
         )
+
+        self.twinnet_data = TwinNetExperimentData(
+            embed_image=partial(vqvae_embed_image, vqvae),
+        )
+
         print('Loaded datasets')
 
         self.images = valmap(
@@ -426,18 +433,11 @@ class RetrievalExperiment:
             assert torch.allclose(image, target_images[0])
 
             relevant_result = target_idxs[0].item()
-
-            def hit_rate_at_k(k: int) -> float:
-                return float(relevant_result in pred_idxs[:k])
-
-            rank = (pred_idxs == relevant_result).nonzero().item()
-            reciprocal_rank = 1 / (1 + rank)
-
             metrics = dict(
                 ndcg=ndcg(pred_idxs, target_idxs),
-                hit_rate_at_1=hit_rate_at_k(1),
-                hit_rate_at_5=hit_rate_at_k(5),
-                reciprocal_rank=reciprocal_rank,
+                hit_rate_at_1=hit_rate(pred_idxs, relevant_result, k=1),
+                hit_rate_at_5=hit_rate(pred_idxs, relevant_result, k=5),
+                reciprocal_rank=reciprocal_rank(pred_idxs, relevant_result),
             )
 
             cumulative_metrics = merge_with(sum, cumulative_metrics, metrics)
@@ -451,7 +451,7 @@ class RetrievalExperiment:
 
     def benchmark_cbir_vqvae(
         self,
-        num_queries: int = 128,
+        num_queries: int = 1000,
     ) -> Dict:
         query_images = valmap(lambda imgs: imgs[:num_queries], self.images)
         results = merge_with(
@@ -463,6 +463,90 @@ class RetrievalExperiment:
 
         return results
 
-    def benchmark_ccbir(self):
-        # TODO
-        raise NotImplementedError
+    def _benchmark_ccbir_pipeline(
+        self,
+        factual_treatment_type: str,
+        counterfactual_treatment_type: str,
+        queries: BatchDict,
+        num_samples: int,
+    ) -> Dict:
+        assert factual_treatment_type != counterfactual_treatment_type
+
+        gt_cbir_star = self.cbir_pipelines[counterfactual_treatment_type]
+        cumulative_metrics = dict()
+
+        for query in tqdm(queries.iter_rows(), total=len(queries)):
+            gt_images = query['ground_truth_image']
+            gt_image_star: Tensor = gt_images[counterfactual_treatment_type]
+            target_images, target_idxs = gt_cbir_star.find_closest(
+                image=gt_image_star,
+                top_k=None,
+            )
+            assert torch.allclose(gt_image_star, target_images[0])
+
+            preds = self.ccbir_pipeline.find_closest_counterfactuals(
+                treatments=query['treatments'],
+                confounders=query['confounders'],
+                observed_factual_images={
+                    factual_treatment_type: gt_images[factual_treatment_type],
+                },
+                num_samples=num_samples,
+                top_k=None,
+            ).dict
+            _pred_images, pred_idxs = preds[counterfactual_treatment_type]
+
+            relevant_result = target_idxs[0].item()
+            metrics = dict(
+                ndcg=ndcg(pred_idxs, target_idxs),
+                hit_rate_at_1=hit_rate(pred_idxs, relevant_result, k=1),
+                hit_rate_at_5=hit_rate(pred_idxs, relevant_result, k=5),
+                hit_rate_at_10=hit_rate(pred_idxs, relevant_result, k=10),
+                hit_rate_at_15=hit_rate(pred_idxs, relevant_result, k=15),
+                reciprocal_rank=reciprocal_rank(pred_idxs, relevant_result),
+            )
+            cumulative_metrics = merge_with(sum, cumulative_metrics, metrics)
+
+        avg_metrics = valmap(lambda x: x / len(queries), cumulative_metrics)
+
+        return avg_metrics
+
+    def benchmark_ccbir(
+        self,
+        num_queries: int = 1000,
+        num_samples: int = 1024,
+    ) -> Dict:
+        psf_items = (
+            self.twinnet_data.psf_items(train=False, index=slice(num_queries))
+        )
+        x, _ = self.twinnet_data.dataset(train=False)[:num_queries]
+
+        queries = BatchDict(dict(
+            treatments=dict(
+                swell=x['factual_treatment'],
+                fracture=x['counterfactual_treatment'],
+            ),
+            ground_truth_image=dict(
+                swell=psf_items['swollen']['image'],
+                fracture=psf_items['fractured']['image'],
+            ),
+            confounders=x['confounders'],
+        ))
+
+        queries = queries.map_features(lambda tensor: tensor.to(self.device))
+
+        results = dict(
+            swell=self._benchmark_ccbir_pipeline(
+                factual_treatment_type='swell',
+                counterfactual_treatment_type='fracture',
+                queries=queries,
+                num_samples=num_samples,
+            ),
+            fracture=self._benchmark_ccbir_pipeline(
+                factual_treatment_type='fracture',
+                counterfactual_treatment_type='swell',
+                queries=queries,
+                num_samples=num_samples,
+            ),
+        )
+
+        return results

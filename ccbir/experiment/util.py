@@ -79,6 +79,7 @@ def plot_tsne(
 
 def ndcg(pred_idxs: LongTensor, target_idxs: LongTensor) -> float:
     assert len(pred_idxs) == len(target_idxs)
+
     num_results = len(pred_idxs)
     relevance_scores = torch.arange(
         start=num_results - 1,
@@ -98,3 +99,25 @@ def ndcg(pred_idxs: LongTensor, target_idxs: LongTensor) -> float:
     ndgc_ = retrieval_normalized_dcg(pred_relevance, target_relevance)
 
     return ndgc_.item()
+
+
+def hit_rate(
+    ranked_result_idxs: LongTensor,
+    relevant_result_idx: int,
+    k: Optional[int] = None,
+) -> float:
+    if k is None:
+        k = -1
+    else:
+        assert k <= len(ranked_result_idxs)
+
+    return float(relevant_result_idx in ranked_result_idxs[:k])
+
+
+def reciprocal_rank(
+    ranked_result_idxs: Tensor,
+    relevant_result_idx: Tensor,
+) -> float:
+    rank = (ranked_result_idxs == relevant_result_idx).nonzero().item()
+    reciprocal_rank_ = 1 / (1 + rank)
+    return reciprocal_rank_

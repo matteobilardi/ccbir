@@ -1,7 +1,7 @@
 from functools import partial
 from multiprocessing.sharedctypes import Value
 from pathlib import Path
-from typing import Any, Callable, Dict, Hashable, Iterable, Literal, Optional, Sequence, TypeVar, Union
+from typing import Any, Callable, Dict, Hashable, Iterable, List, Literal, Optional, Sequence, TypeVar, Union
 from torch import Tensor
 from toolz import curry, valmap, merge_with, identity
 import toolz.curried as C
@@ -215,3 +215,15 @@ def array_like_ncycles(array_like: A, n: int) -> A:
         return numpy_ncycles(array_like, n)
     else:
         raise TypeError(f"Unsupported type {type(array_like)}")
+
+
+@curry
+def split_apply_cat(
+    func: Callable[[Tensor], Tensor],
+    input: Tensor,
+    split_size=1024,
+) -> Tensor:
+    """Assumes that func works on batches and input is batched. Used to reduce
+    memory consumption of calling func on a very large batched input and avoid
+    out-of-memory errors."""
+    return torch.cat(tuple(map(func, torch.split(input, split_size))))

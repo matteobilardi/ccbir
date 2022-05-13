@@ -62,6 +62,7 @@ class TwinNetExperimentData(ExperimentData):
                 PSFTwinNetDataModule,
                 embed_image=embed_image,
                 num_workers=1,
+                repeats=1,
             )
         )
 

@@ -1,7 +1,7 @@
 from typing import Dict, Optional, Tuple
 from more_itertools import all_equal, first
 from torch import LongTensor, Tensor
-from ccbir.util import star_apply
+from ccbir.util import leaves_map, star_apply
 from ccbir.data.util import BatchDict
 from ccbir.inference.engine import InferenceEngine
 from ccbir.retrieval.cbir import CBIR_Pipeline
@@ -35,6 +35,7 @@ class CCBIR_Pipeline:
         confounders: Tensor,
         observed_factual_images: Dict[str, Tensor],
         top_k: Optional[int] = 1,
+        num_samples=1024,
     ) -> BatchDict:
         observed_factual_embeddings = valmap(
             func=self.extract_embedding,
@@ -43,9 +44,15 @@ class CCBIR_Pipeline:
         best_sampled_embeddings = self.inference_engine.infer_outcomes(
             treatments=treatments,
             confounders=confounders,
+            num_samples=num_samples,
             observed_factual_outcomes=observed_factual_embeddings,
             top_k=1,  # this is meant to be 1
         ).dict
+
+        best_sampled_embeddings = valmap(
+            lambda t: t.squeeze(0),
+            best_sampled_embeddings,
+        )
 
         def _find_closest_by_embedding(
             cbir: CBIR_Pipeline,
