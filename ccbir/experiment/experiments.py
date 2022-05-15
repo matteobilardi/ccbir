@@ -180,7 +180,7 @@ class PSFTwinNetExperiment:
                 ground_truth_strip = make_grid(
                     tensor=ground_truths,
                     normalize=True,
-                    value_range=(-1, 1)
+                    value_range=(-1, 1),
                 )
                 metadata['ground_truth_strip'] = ground_truth_strip
 
@@ -379,7 +379,6 @@ class RetrievalExperiment:
     ):
         assert vqvae.device == twinnet.device
         self.device = vqvae.device
-        normalize = transforms.Normalize(mean=0.5, std=0.5)
         twinnet_data = TwinNetExperimentData(
             embed_image=partial(vqvae_embed_image, vqvae),
         )
@@ -418,6 +417,51 @@ class RetrievalExperiment:
         assert 0 <= label <= 9
         labels: LongTensor = self.data.dict['ground_truth']['label']
         return labels == label
+
+    def cbir_show_query_result(
+        self,
+        treatment_type: Literal['swell', 'fracture'],
+        query_idx: int,
+        top_k: int = 64,
+    ):
+        cbir = self.cbirs[treatment_type]
+        image = self.data[query_idx]['ground_truth']['image'][treatment_type]
+        show_tensor(image, dpi=50)
+        images, _idxs = cbir.find_closest(image, top_k=top_k)
+        show_tensor(
+            make_grid(tensor=images, normalize=True, value_range=(-1, 1))
+        )
+
+    def ccbir_show_query_result(
+        self,
+        query_idx: int,
+        factual_treatment_type: Literal['swell', 'fracture'],
+        counterfactual_treatment_type: Literal['swell', 'fracture'],
+        top_k: int = 64,
+    ):
+        factual_treatment_type != counterfactual_treatment_type
+
+        query = self.data[query_idx]
+        images = query['ground_truth']['image']
+        for img in images.values():
+            show_tensor(img, dpi=50)
+
+        observed_factual_images = {
+            factual_treatment_type: images[factual_treatment_type],
+        }
+
+        results = self.ccbir.find_closest_counterfactuals(
+            treatments=query['treatments'],
+            confounders=query['confounders'],
+            observed_factual_images=observed_factual_images,
+            top_k=top_k,
+        ).dict
+
+        images, _idxs = results[counterfactual_treatment_type]
+
+        show_tensor(
+            make_grid(tensor=images, normalize=True, value_range=(-1, 1))
+        )
 
     def _query_metrics(
         self,

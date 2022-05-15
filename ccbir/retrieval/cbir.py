@@ -8,7 +8,7 @@ from ccbir.models.vqvae.model import VQVAE
 from einops import reduce, repeat
 from torch import LongTensor, Tensor
 from torchmetrics.functional import structural_similarity_index_measure as ssim
-from typing import Callable, Dict, Optional, Tuple
+from typing import Optional, Tuple
 import torch
 
 
