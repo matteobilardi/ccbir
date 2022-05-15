@@ -1,8 +1,11 @@
 from sklearn.manifold import TSNE
-from torch import LongTensor, Tensor
-from torchmetrics.functional import retrieval_normalized_dcg
+from torch import BoolTensor, LongTensor, Tensor
+from torchmetrics.functional import (
+    retrieval_normalized_dcg,
+    retrieval_average_precision,
+)
 from torchvision import transforms
-from typing import Dict, Iterable, Literal, Optional
+from typing import Dict, Iterable, Literal, Optional, Set
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
@@ -109,15 +112,39 @@ def hit_rate(
     if k is None:
         k = -1
     else:
-        assert k <= len(ranked_result_idxs)
+        assert 0 <= k <= len(ranked_result_idxs)
 
     return float(relevant_result_idx in ranked_result_idxs[:k])
 
 
 def reciprocal_rank(
     ranked_result_idxs: Tensor,
-    relevant_result_idx: Tensor,
+    relevant_result_idx: int,
 ) -> float:
     rank = (ranked_result_idxs == relevant_result_idx).nonzero().item()
     reciprocal_rank_ = 1 / (1 + rank)
     return reciprocal_rank_
+
+
+def avg_precision(
+    ranked_result_idxs: Tensor,
+    is_relevant_idx: BoolTensor,
+    k: Optional[int] = None,
+) -> float:
+    num_results = len(ranked_result_idxs)
+    num_relevant = is_relevant_idx.count_nonzero()
+    if k is None:
+        k = num_results
+    else:
+        assert 0 <= k <= num_results
+
+    relevant_preds = torch.cat((
+        torch.ones(num_relevant),
+        torch.zeros(num_results - num_relevant),
+    ))
+    relevant_target = is_relevant_idx[ranked_result_idxs]
+
+    return retrieval_average_precision(
+        preds=relevant_preds[:k],
+        target=relevant_target[:k],
+    ).item()

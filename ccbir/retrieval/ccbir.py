@@ -4,15 +4,15 @@ from torch import LongTensor, Tensor
 from ccbir.util import leaves_map, star_apply
 from ccbir.data.util import BatchDict
 from ccbir.inference.engine import InferenceEngine
-from ccbir.retrieval.cbir import CBIR_Pipeline
+from ccbir.retrieval.cbir import CBIR
 from toolz import valmap, merge_with
 
 
-class CCBIR_Pipeline:
+class CCBIR:
     def __init__(
         self,
         inference_engine: InferenceEngine,
-        cbir_for_treatment_type: Dict[str, CBIR_Pipeline],
+        cbir_for_treatment_type: Dict[str, CBIR],
     ):
         cbirs = cbir_for_treatment_type
 
@@ -55,7 +55,7 @@ class CCBIR_Pipeline:
         )
 
         def _find_closest_by_embedding(
-            cbir: CBIR_Pipeline,
+            cbir: CBIR,
             embedding: Tensor,
         ) -> Tuple[Tensor, LongTensor]:
             return cbir.find_closest_by_embedding(

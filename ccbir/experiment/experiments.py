@@ -1,33 +1,35 @@
+from ast import Return
 from matplotlib import image
+from sklearn.metrics import average_precision_score
 from ccbir.data.morphomnist.dataset import (
     FracturedMorphoMNIST,
     SwollenMorphoMNIST
 )
 from ccbir.data.util import BatchDict
 from ccbir.experiment.data import TwinNetExperimentData, VQVAEExperimentData
-from ccbir.experiment.util import hit_rate, ndcg, plot_tsne, reciprocal_rank, show_tensor
+from ccbir.experiment.util import avg_precision, hit_rate, ndcg, plot_tsne, reciprocal_rank, show_tensor
 from ccbir.inference.engine import SwollenFracturedMorphoMNIST_Engine
 from ccbir.models.twinnet.model import PSFTwinNet
 from ccbir.models.twinnet.train import vqvae_embed_image
 from ccbir.models.vqvae.model import VQVAE
 from ccbir.retrieval.cbir import (
-    CBIR_Pipeline,
-    SSIM_CBIR_Pipeline,
-    VQVAE_CBIR_Pipeline,
+    CBIR,
+    SSIM_CBIR,
+    VQVAE_CBIR,
 )
-from ccbir.retrieval.ccbir import CCBIR_Pipeline
+from ccbir.retrieval.ccbir import CCBIR
 from ccbir.util import leaves_map, maybe_unbatched_apply, star_apply
 from functools import partial
 from more_itertools import interleave
-from toolz import first, merge_with, valmap, compose
-from torch import LongTensor, Tensor
+from toolz import first, merge_with, valmap, compose, dissoc, memoize
+from torch import BoolTensor, LongTensor, Tensor
 from torchmetrics.functional import (
     structural_similarity_index_measure as ssim,
 )
 from torchvision import transforms
 from torchvision.utils import make_grid
 from tqdm import tqdm
-from typing import Callable, Dict, Iterable, List, Literal, Optional, Type, Union
+from typing import Callable, Dict, Iterable, List, Literal, Optional, Set, Type, Union
 import matplotlib.pyplot as plt
 import pandas as pd
 import pytorch_lightning as pl
@@ -372,98 +374,131 @@ class RetrievalExperiment:
         self,
         vqvae: VQVAE,
         twinnet: PSFTwinNet,
-        train_datasets: bool = False,
+        train: bool = False,
         num_images: int = -1,  # include all images by default
     ):
         assert vqvae.device == twinnet.device
         self.device = vqvae.device
-
         normalize = transforms.Normalize(mean=0.5, std=0.5)
-        kwargs = dict(
-            train=train_datasets,
-            transform=partial(
-                BatchDict.map,
-                func=lambda item: dict(image=normalize(item['image'])),
-            ),
-            repeats=1,
-        )
-
-        print('Loading datasets')
-        datasets = dict(
-            swell=SwollenMorphoMNIST(**kwargs),
-            fracture=FracturedMorphoMNIST(**kwargs),
-        )
-
-        self.twinnet_data = TwinNetExperimentData(
+        twinnet_data = TwinNetExperimentData(
             embed_image=partial(vqvae_embed_image, vqvae),
         )
+        psf_items = twinnet_data.psf_items(train, slice(num_images))
+        x, _y = twinnet_data.dataset(train)[:num_images]
+        self.data = BatchDict(dict(
+            treatments=dict(
+                swell=x['factual_treatment'],
+                fracture=x['counterfactual_treatment'],
+            ),
+            ground_truth=dict(
+                image=dict(
+                    swell=psf_items['swollen']['image'],
+                    fracture=psf_items['fractured']['image'],
+                ),
+                label=psf_items['plain']['label'],
+            ),
+            confounders=x['confounders'],
+        )).map_features(lambda t: t.to(self.device))
 
-        print('Loaded datasets')
-
-        self.images = valmap(
-            lambda d: d[:num_images]['image'].to(self.device),
-            datasets,
+        images = self.data.dict['ground_truth']['image']
+        self.ground_truth_cbirs: Dict[str, CBIR] = valmap(SSIM_CBIR, images)
+        self.cbirs: Dict[str, CBIR] = (
+            valmap(partial(VQVAE_CBIR, vqvae=vqvae), images)
         )
-        self.ground_truth_cbir_pipelines: Dict[str, CBIR_Pipeline] = (
-            valmap(SSIM_CBIR_Pipeline, self.images)
-        )
-        self.cbir_pipelines: Dict[str, CBIR_Pipeline] = (
-            valmap(partial(VQVAE_CBIR_Pipeline, vqvae=vqvae), self.images)
-        )
-        self.ccbir_pipeline = CCBIR_Pipeline(
+        self.ccbir = CCBIR(
             inference_engine=SwollenFracturedMorphoMNIST_Engine(
                 vqvae=vqvae,
                 twinnet=twinnet,
             ),
-            cbir_for_treatment_type=self.cbir_pipelines,
+            cbir_for_treatment_type=self.cbirs,
         )
 
-    def _benchmark_cbir_pipeline(
+    @memoize
+    def _relevant_idx_for_label(self, label: int) -> BoolTensor:
+        assert 0 <= label <= 9
+        labels: LongTensor = self.data.dict['ground_truth']['label']
+        return labels == label
+
+    def _query_metrics(
         self,
-        query_images: Tensor,
-        cbir: CBIR_Pipeline,
-        ground_truth_cbir: CBIR_Pipeline,
+        pred_idxs: LongTensor,
+        target_idxs: LongTensor,
+        ground_truth_idx: int,
+        ground_truth_label: int,
+    ) -> Dict:
+        is_relvant_idx = self._relevant_idx_for_label(ground_truth_label)
+        return dict(
+            hit_rate_at_1=hit_rate(pred_idxs, ground_truth_idx, k=1),
+            hit_rate_at_5=hit_rate(pred_idxs, ground_truth_idx, k=5),
+            hit_rate_at_10=hit_rate(pred_idxs, ground_truth_idx, k=10),
+            hit_rate_at_15=hit_rate(pred_idxs, ground_truth_idx, k=15),
+            reciprocal_rank=reciprocal_rank(pred_idxs, ground_truth_idx),
+            ssim_ndcg=ndcg(pred_idxs, target_idxs),
+            label_avg_precision=avg_precision(pred_idxs, is_relvant_idx),
+            label_avg_precision_at_1000=(
+                avg_precision(pred_idxs, is_relvant_idx, k=1000)
+            ),
+        )
+
+    def _benchmark_cbir(
+        self,
+        queries: BatchDict,
+        cbir: CBIR,
+        ground_truth_cbir: CBIR,
     ) -> Dict:
         cumulative_metrics = dict()
-        for image in tqdm(query_images):
+        for query in tqdm(queries.iter_rows(), total=len(queries)):
+            image = query['image']
             _, pred_idxs = cbir.find_closest(image, top_k=None)
             target_images, target_idxs = (
                 ground_truth_cbir.find_closest(image, top_k=None)
             )
             assert torch.allclose(image, target_images[0])
 
-            relevant_result = target_idxs[0].item()
-            metrics = dict(
-                ndcg=ndcg(pred_idxs, target_idxs),
-                hit_rate_at_1=hit_rate(pred_idxs, relevant_result, k=1),
-                hit_rate_at_5=hit_rate(pred_idxs, relevant_result, k=5),
-                reciprocal_rank=reciprocal_rank(pred_idxs, relevant_result),
+            metrics = self._query_metrics(
+                pred_idxs=pred_idxs,
+                target_idxs=target_idxs,
+                ground_truth_idx=target_idxs[0].item(),
+                ground_truth_label=query['label'].item(),
             )
 
             cumulative_metrics = merge_with(sum, cumulative_metrics, metrics)
 
         avg_metrics = valmap(
-            lambda x: x / len(query_images),
+            lambda x: x / len(queries),
             cumulative_metrics,
         )
 
         return avg_metrics
 
-    def benchmark_cbir_vqvae(
+    def benchmark_cbir(
         self,
         num_queries: int = 1000,
     ) -> Dict:
-        query_images = valmap(lambda imgs: imgs[:num_queries], self.images)
-        results = merge_with(
-            star_apply(self._benchmark_cbir_pipeline),
-            query_images,
-            self.cbir_pipelines,
-            self.ground_truth_cbir_pipelines,
+        queries = BatchDict(self.data[:num_queries]['ground_truth'])
+        _benchmark_cbir = partial(self._benchmark_cbir, queries)
+
+        def queries_for(treatment_type) -> BatchDict:
+            return queries.map(
+                C.update_in(keys=['image'], func=C.get(treatment_type))
+            )
+
+        results = dict(
+            swell=self._benchmark_cbir(
+                queries=queries_for('swell'),
+                cbir=self.cbirs['swell'],
+                ground_truth_cbir=self.ground_truth_cbirs['swell'],
+            ),
+            fracture=self._benchmark_cbir(
+                queries=queries_for('fracture'),
+                cbir=self.cbirs['fracture'],
+                ground_truth_cbir=self.ground_truth_cbirs['fracture'],
+            ),
         )
 
         return results
 
-    def _benchmark_ccbir_pipeline(
+    def _benchmark_ccbir(
         self,
         factual_treatment_type: str,
         counterfactual_treatment_type: str,
@@ -472,11 +507,11 @@ class RetrievalExperiment:
     ) -> Dict:
         assert factual_treatment_type != counterfactual_treatment_type
 
-        gt_cbir_star = self.cbir_pipelines[counterfactual_treatment_type]
+        gt_cbir_star = self.cbirs[counterfactual_treatment_type]
         cumulative_metrics = dict()
 
         for query in tqdm(queries.iter_rows(), total=len(queries)):
-            gt_images = query['ground_truth_image']
+            gt_images = query['ground_truth']['image']
             gt_image_star: Tensor = gt_images[counterfactual_treatment_type]
             target_images, target_idxs = gt_cbir_star.find_closest(
                 image=gt_image_star,
@@ -484,25 +519,23 @@ class RetrievalExperiment:
             )
             assert torch.allclose(gt_image_star, target_images[0])
 
-            preds = self.ccbir_pipeline.find_closest_counterfactuals(
+            preds = self.ccbir.find_closest_counterfactuals(
                 treatments=query['treatments'],
                 confounders=query['confounders'],
-                observed_factual_images={
-                    factual_treatment_type: gt_images[factual_treatment_type],
-                },
+                observed_factual_images=dissoc(
+                    gt_images,
+                    counterfactual_treatment_type,
+                ),
                 num_samples=num_samples,
                 top_k=None,
             ).dict
             _pred_images, pred_idxs = preds[counterfactual_treatment_type]
 
-            relevant_result = target_idxs[0].item()
-            metrics = dict(
-                ndcg=ndcg(pred_idxs, target_idxs),
-                hit_rate_at_1=hit_rate(pred_idxs, relevant_result, k=1),
-                hit_rate_at_5=hit_rate(pred_idxs, relevant_result, k=5),
-                hit_rate_at_10=hit_rate(pred_idxs, relevant_result, k=10),
-                hit_rate_at_15=hit_rate(pred_idxs, relevant_result, k=15),
-                reciprocal_rank=reciprocal_rank(pred_idxs, relevant_result),
+            metrics = self._query_metrics(
+                pred_idxs=pred_idxs,
+                target_idxs=target_idxs,
+                ground_truth_idx=target_idxs[0].item(),
+                ground_truth_label=query['ground_truth']['label'].item(),
             )
             cumulative_metrics = merge_with(sum, cumulative_metrics, metrics)
 
@@ -515,33 +548,15 @@ class RetrievalExperiment:
         num_queries: int = 1000,
         num_samples: int = 1024,
     ) -> Dict:
-        psf_items = (
-            self.twinnet_data.psf_items(train=False, index=slice(num_queries))
-        )
-        x, _ = self.twinnet_data.dataset(train=False)[:num_queries]
-
-        queries = BatchDict(dict(
-            treatments=dict(
-                swell=x['factual_treatment'],
-                fracture=x['counterfactual_treatment'],
-            ),
-            ground_truth_image=dict(
-                swell=psf_items['swollen']['image'],
-                fracture=psf_items['fractured']['image'],
-            ),
-            confounders=x['confounders'],
-        ))
-
-        queries = queries.map_features(lambda tensor: tensor.to(self.device))
-
+        queries = BatchDict(self.data[:num_queries])
         results = dict(
-            swell=self._benchmark_ccbir_pipeline(
+            swell=self._benchmark_ccbir(
                 factual_treatment_type='swell',
                 counterfactual_treatment_type='fracture',
                 queries=queries,
                 num_samples=num_samples,
             ),
-            fracture=self._benchmark_ccbir_pipeline(
+            fracture=self._benchmark_ccbir(
                 factual_treatment_type='fracture',
                 counterfactual_treatment_type='swell',
                 queries=queries,

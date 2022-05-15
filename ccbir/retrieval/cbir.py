@@ -12,7 +12,7 @@ from typing import Callable, Dict, Optional, Tuple
 import torch
 
 
-class CBIR_Pipeline(ABC):
+class CBIR(ABC):
     def __init__(
         self,
         images: Tensor,
@@ -68,7 +68,7 @@ class CBIR_Pipeline(ABC):
         raise NotImplementedError
 
 
-class SSIM_CBIR_Pipeline(CBIR_Pipeline):
+class SSIM_CBIR(CBIR):
     def __init__(self, images: Tensor, embeddings: Optional[Tensor] = None):
         super().__init__(images, embeddings)
 
@@ -90,7 +90,7 @@ class SSIM_CBIR_Pipeline(CBIR_Pipeline):
         return image
 
 
-class VQVAE_CBIR_Pipeline(CBIR_Pipeline):
+class VQVAE_CBIR(CBIR):
     def __init__(
         self,
         images: Tensor,
