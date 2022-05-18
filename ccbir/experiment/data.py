@@ -1,7 +1,9 @@
 from functools import cached_property, partial
 from typing import Callable, Dict, Optional, Type, Union
+
+from torch import Tensor
 from ccbir.models.twinnet.data import PSFTwinNetDataModule
-from ccbir.models.vqvae.data import VQVAEMorphoMNISTDataModule
+from ccbir.models.vqvae.data import OriginalMNIST_VQVAE_Dataset, SwellFractureVQVAE_Dataset, VQVAE_MorphoMNIST_DataModule
 import pytorch_lightning as pl
 from torch.utils.data import Dataset, DataLoader
 
@@ -29,19 +31,25 @@ class ExperimentData:
         return dm
 
     @cached_property
-    def _train_dataset(self):
+    def train_dataset(self):
         dm = self.datamodule
         dataset = dm.train_dataloader().dataset
         return dataset
 
     @cached_property
-    def _test_dataset(self):
+    def _val_dataset(self):
+        dm = self.datamodule
+        dataset = dm.val_dataloader().dataset
+        return dataset
+
+    @cached_property
+    def test_dataset(self):
         dm = self.datamodule
         dataset = dm.test_dataloader().dataset
         return dataset
 
     def dataset(self, train: bool) -> Dataset:
-        return self._train_dataset if train else self._test_dataset
+        return self.train_dataset if train else self.test_dataset
 
     def dataloader(self, train: bool):
         if train:
@@ -50,19 +58,33 @@ class ExperimentData:
             return self.datamodule.test_dataloader()
 
 
-class VQVAEExperimentData(ExperimentData):
+class SwellFractureVQVAE_ExperimentData(ExperimentData):
     def __init__(self):
-        super().__init__(VQVAEMorphoMNISTDataModule)
+        super().__init__(
+            datamodule_ctor=partial(
+                VQVAE_MorphoMNIST_DataModule,
+                datataset=SwellFractureVQVAE_Dataset,
+            )
+        )
+
+
+class OriginalMNIST_VQVAE_ExperimentData(ExperimentData):
+    def __init__(self):
+        super().__init__(
+            datamodule_ctor=partial(
+                VQVAE_MorphoMNIST_DataModule,
+                dataset_type=OriginalMNIST_VQVAE_Dataset,
+            )
+        )
 
 
 class TwinNetExperimentData(ExperimentData):
-    def __init__(self, embed_image):
+    def __init__(self, embed_image: Callable[..., Tensor], repeats: int = 1):
         super().__init__(
             datamodule_ctor=partial(
                 PSFTwinNetDataModule,
                 embed_image=embed_image,
-                num_workers=1,
-                repeats=1,
+                repeats=repeats,
             )
         )
 

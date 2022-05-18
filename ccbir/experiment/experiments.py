@@ -1,12 +1,12 @@
-from ast import Return
-from matplotlib import image
-from sklearn.metrics import average_precision_score
+import numpy as np
+from sklearn.metrics import PrecisionRecallDisplay, average_precision_score
+from sympy import sequence
 from ccbir.data.morphomnist.dataset import (
     FracturedMorphoMNIST,
     SwollenMorphoMNIST
 )
 from ccbir.data.util import BatchDict
-from ccbir.experiment.data import TwinNetExperimentData, VQVAEExperimentData
+from ccbir.experiment.data import OriginalMNIST_VQVAE_ExperimentData, TwinNetExperimentData, SwellFractureVQVAE_ExperimentData
 from ccbir.experiment.util import avg_precision, hit_rate, ndcg, plot_tsne, reciprocal_rank, show_tensor
 from ccbir.inference.engine import SwollenFracturedMorphoMNIST_Engine
 from ccbir.models.twinnet.model import PSFTwinNet
@@ -20,16 +20,17 @@ from ccbir.retrieval.cbir import (
 from ccbir.retrieval.ccbir import CCBIR
 from ccbir.util import leaves_map, maybe_unbatched_apply, star_apply
 from functools import partial
-from more_itertools import interleave
-from toolz import first, merge_with, valmap, compose, dissoc, memoize
-from torch import BoolTensor, LongTensor, Tensor
+from more_itertools import all_equal, interleave, unzip
+from toolz import first, merge_with, valmap, compose, concat, memoize
+from torch import BoolTensor, LongTensor, Tensor, randperm
+from torch.utils.data import default_collate
 from torchmetrics.functional import (
     structural_similarity_index_measure as ssim,
 )
 from torchvision import transforms
 from torchvision.utils import make_grid
 from tqdm import tqdm
-from typing import Callable, Dict, Iterable, List, Literal, Optional, Set, Type, Union
+from typing import Callable, Dict, Iterable, List, Literal, Optional, Set, Tuple, Type, Union
 import matplotlib.pyplot as plt
 import pandas as pd
 import pytorch_lightning as pl
@@ -41,7 +42,7 @@ class VQVAEExperiment:
     def __init__(self, vqvae: VQVAE):
         self.vqvae = vqvae
         self.device = vqvae.device
-        self.data = VQVAEExperimentData()
+        self.data = SwellFractureVQVAE_ExperimentData()
 
         # TODO: hacky - this should not be needed in VQVAE experiments
         self.twinnet_data = TwinNetExperimentData(
@@ -205,15 +206,16 @@ class PSFTwinNetExperiment:
         num_samples: int = 1024,
         noise_scale: float = 1.0,
         max_items: int = 20000,
+        train: bool = False,
     ) -> Dict:
         prepare_query = partial(
             self.prepare_query,
-            train=False,
+            train=train,
             condition_on_factual_outcome=True,
             include_metadata=True,
             include_ground_truth_strip=False,
         )
-        num_items = min(max_items, len(self.data.dataset(train=False)))
+        num_items = min(max_items, len(self.data.dataset(train=train)))
         item_idxs = range(num_items)
         queries = map(prepare_query, item_idxs)
         cumulative_metrics = dict()
@@ -373,36 +375,46 @@ class RetrievalExperiment:
     def __init__(
         self,
         vqvae: VQVAE,
+        vqvae_original_mnist: VQVAE,
         twinnet: PSFTwinNet,
-        train: bool = False,
-        num_images: int = -1,  # include all images by default
+        #     num_images: int = -1,  # include all images by default
     ):
-        assert vqvae.device == twinnet.device
+        assert all_equal((
+            vqvae.device,
+            twinnet.device,
+            vqvae_original_mnist.device,
+        ))
+
         self.device = vqvae.device
-        twinnet_data = TwinNetExperimentData(
+        self.vqvae = vqvae
+        self.twinnet = twinnet
+        self.twinnet_data = TwinNetExperimentData(
             embed_image=partial(vqvae_embed_image, vqvae),
         )
-        psf_items = twinnet_data.psf_items(train, slice(num_images))
-        x, _y = twinnet_data.dataset(train)[:num_images]
-        self.data = BatchDict(dict(
-            treatments=dict(
-                swell=x['factual_treatment'],
-                fracture=x['counterfactual_treatment'],
-            ),
-            ground_truth=dict(
-                image=dict(
-                    swell=psf_items['swollen']['image'],
-                    fracture=psf_items['fractured']['image'],
-                ),
-                label=psf_items['plain']['label'],
-            ),
-            confounders=x['confounders'],
-        )).map_features(lambda t: t.to(self.device))
 
-        images = self.data.dict['ground_truth']['image']
-        self.ground_truth_cbirs: Dict[str, CBIR] = valmap(SSIM_CBIR, images)
-        self.cbirs: Dict[str, CBIR] = (
-            valmap(partial(VQVAE_CBIR, vqvae=vqvae), images)
+        queries_data, partial_gallery_data, full_gallery_data = (
+            self._load_queries_and_gallery_data()
+        )
+
+        self.queries_data = queries_data
+        self.partial_gallery_data = partial_gallery_data
+        self.full_gallery_data = full_gallery_data
+
+        full_gallery = full_gallery_data.dict['ground_truth']['image']
+        partial_gallery = partial_gallery_data.dict['ground_truth']['image']
+
+        self.ground_truth_cbirs: Dict[str, CBIR] = dict(
+            swell=SSIM_CBIR(full_gallery['swell']),
+            fracture=SSIM_CBIR(full_gallery['fracture']),
+            original=SSIM_CBIR(partial_gallery['original']),
+        )
+        self.cbirs: Dict[str, CBIR] = dict(
+            swell=VQVAE_CBIR(full_gallery['swell'], vqvae),
+            fracture=VQVAE_CBIR(full_gallery['fracture'], vqvae),
+            original=VQVAE_CBIR(
+                images=partial_gallery['original'],
+                vqvae=vqvae_original_mnist,
+            ),
         )
         self.ccbir = CCBIR(
             inference_engine=SwollenFracturedMorphoMNIST_Engine(
@@ -412,11 +424,130 @@ class RetrievalExperiment:
             cbir_for_treatment_type=self.cbirs,
         )
 
-    @memoize
-    def _relevant_idx_for_label(self, label: int) -> BoolTensor:
-        assert 0 <= label <= 9
-        labels: LongTensor = self.data.dict['ground_truth']['label']
-        return labels == label
+    def _load_queries_and_gallery_data(
+        self,
+        num_queries: int = 1000,
+    ) -> Tuple[BatchDict, BatchDict, BatchDict]:
+        twinnet_data = TwinNetExperimentData(
+            embed_image=partial(vqvae_embed_image, self.vqvae),
+        )
+        assert num_queries % 10 == 0
+
+        original_mnist_data = OriginalMNIST_VQVAE_ExperimentData()
+        original_mnist_train_val = original_mnist_data.train_dataset.dataset
+        original_mnist_test = original_mnist_data.test_dataset
+
+        def cat(dicts_or_sequences):
+            dicts = all(map(lambda d: isinstance(d, dict), dicts_or_sequences))
+            if dicts:
+                return merge_with(cat, *dicts_or_sequences)
+            else:
+                sequences = dicts_or_sequences
+                assert all_equal(map(type, sequences))
+                seq1 = sequences[0]
+                if isinstance(seq1, Tensor):
+                    return torch.cat(sequences)
+                elif isinstance(seq1, np.ndarray):
+                    return np.concatenate(sequences)
+                elif isinstance(seq1, list):
+                    return list(concat(sequences))
+                else:
+                    raise TypeError(f"Unsupported type {type(seq1)}")
+
+        original_mnist_images = cat((
+            original_mnist_test.get_items().dict,
+            original_mnist_train_val.get_items().dict,
+        ))['image']
+
+        test_dataset = twinnet_data.test_dataset
+        train_val_dataset = twinnet_data.train_dataset.dataset
+        psf_items_test = test_dataset.psf_items.dict
+        psf_items_train = train_val_dataset.psf_items.dict
+        psf_items = cat((psf_items_test, psf_items_train))
+
+        items = cat((
+            test_dataset.get_items().dict,
+            train_val_dataset.get_items().dict,
+        ))
+        x = items['x']
+
+        labels = psf_items['plain']['label']
+
+        data = BatchDict(dict(
+            treatments=dict(
+                swell=x['factual_treatment'],
+                fracture=x['counterfactual_treatment'],
+            ),
+            ground_truth=dict(
+                image=dict(
+                    swell=psf_items['swollen']['image'],
+                    fracture=psf_items['fractured']['image'],
+                    original=original_mnist_images,
+                ),
+                label=labels,
+            ),
+            confounders=x['confounders'],
+        )).map_features(lambda t: t.to(self.device))
+
+        generator = torch.Generator(self.device).manual_seed(42)
+
+        test_labels = psf_items_test['plain']['label'].to(self.device)
+        num_queries_per_class = num_queries // 10
+
+        def random_subset_query_idxs(class_queries_idxs):
+            rand_idxs = torch.randperm(
+                n=len(class_queries_idxs),
+                generator=generator,
+                device=class_queries_idxs.device,
+            )
+            _queries_idxs = rand_idxs[:num_queries_per_class]
+            _test_gallery_idxs = rand_idxs[num_queries_per_class:]
+            return (
+                class_queries_idxs[_queries_idxs],
+                class_queries_idxs[_test_gallery_idxs]
+            )
+
+        query_idxs_for_class, test_gallery_idxs_for_class = unzip(
+            random_subset_query_idxs(
+                (digit == test_labels).nonzero().flatten()
+            ) for digit in range(10)
+        )
+        query_idxs = torch.cat(list(query_idxs_for_class))
+        test_gallery_idxs = torch.cat(list(test_gallery_idxs_for_class))
+
+        assert len(query_idxs) + len(test_gallery_idxs) == len(test_labels)
+        assert torch.all(torch.eq(
+            torch.unique(torch.cat([query_idxs, test_gallery_idxs])),
+            torch.arange(len(test_dataset), device=self.device)
+        ))
+
+        queries_data = BatchDict(data[query_idxs])
+        assert len(queries_data) == num_queries
+
+        train_gallery_idxs = len(test_labels) + torch.randperm(
+            n=len(train_val_dataset),
+            generator=generator,
+            device=self.device,
+        )
+        partial_gallery_idxs = torch.cat([
+            test_gallery_idxs,
+            train_gallery_idxs,
+        ])
+
+        partial_gallery_data = BatchDict(data[partial_gallery_idxs])
+        full_gallery_idxs = torch.cat([
+            query_idxs,
+            partial_gallery_idxs,
+        ])
+        assert len(full_gallery_idxs) == len(data)
+        full_gallery_data = BatchDict(data[full_gallery_idxs])
+        assert (
+            len(queries_data) + len(partial_gallery_data)
+            == len(full_gallery_data)
+        )
+        assert len(full_gallery_data) == 70_000
+
+        return queries_data, partial_gallery_data, full_gallery_data
 
     def cbir_show_query_result(
         self,
@@ -425,7 +556,10 @@ class RetrievalExperiment:
         top_k: int = 64,
     ):
         cbir = self.cbirs[treatment_type]
-        image = self.data[query_idx]['ground_truth']['image'][treatment_type]
+        image = (
+            self.queries_data
+            [query_idx]['ground_truth']['image'][treatment_type]
+        )
         show_tensor(image, dpi=50)
         images, _idxs = cbir.find_closest(image, top_k=top_k)
         show_tensor(
@@ -463,14 +597,34 @@ class RetrievalExperiment:
             make_grid(tensor=images, normalize=True, value_range=(-1, 1))
         )
 
+    @memoize
+    def _is_relevant_idx(
+        self,
+        relevant_label: int,
+        full_gallery: bool,
+    ) -> Tensor:
+        gallery_data = (
+            self.full_gallery_data if full_gallery else
+            self.partial_gallery_data
+        )
+        label = gallery_data.dict['ground_truth']['label']
+        is_relvant_idx = label == relevant_label
+
+        return is_relvant_idx
+
     def _query_metrics(
         self,
         pred_idxs: LongTensor,
         target_idxs: LongTensor,
         ground_truth_idx: int,
         ground_truth_label: int,
+        full_gallery: bool,
     ) -> Dict:
-        is_relvant_idx = self._relevant_idx_for_label(ground_truth_label)
+        is_relvant_idx = self._is_relevant_idx(
+            ground_truth_label,
+            full_gallery,
+        )
+
         return dict(
             hit_rate_at_1=hit_rate(pred_idxs, ground_truth_idx, k=1),
             hit_rate_at_5=hit_rate(pred_idxs, ground_truth_idx, k=5),
@@ -484,11 +638,23 @@ class RetrievalExperiment:
             ),
         )
 
+    def show_precision_recall_curve(
+        self,
+        benchmark_results: Dict,
+    ):
+        raise NotImplementedError
+        PrecisionRecallDisplay(
+            precision=benchmark_results['precision'],
+            recall=benchmark_results['recall']
+        ).plot()
+        plt.show()
+
     def _benchmark_cbir(
         self,
         queries: BatchDict,
         cbir: CBIR,
         ground_truth_cbir: CBIR,
+        full_gallery: Optional[bool] = True
     ) -> Dict:
         cumulative_metrics = dict()
         for query in tqdm(queries.iter_rows(), total=len(queries)):
@@ -497,13 +663,16 @@ class RetrievalExperiment:
             target_images, target_idxs = (
                 ground_truth_cbir.find_closest(image, top_k=None)
             )
-            assert torch.allclose(image, target_images[0])
+
+            if full_gallery:
+                assert torch.allclose(image, target_images[0])
 
             metrics = self._query_metrics(
                 pred_idxs=pred_idxs,
                 target_idxs=target_idxs,
                 ground_truth_idx=target_idxs[0].item(),
                 ground_truth_label=query['label'].item(),
+                full_gallery=full_gallery,
             )
 
             cumulative_metrics = merge_with(sum, cumulative_metrics, metrics)
@@ -515,30 +684,26 @@ class RetrievalExperiment:
 
         return avg_metrics
 
+    @torch.no_grad()
     def benchmark_cbir(
         self,
         num_queries: int = 1000,
     ) -> Dict:
-        queries = BatchDict(self.data[:num_queries]['ground_truth'])
-        _benchmark_cbir = partial(self._benchmark_cbir, queries)
+        queries = BatchDict(self.queries_data[:num_queries]['ground_truth'])
 
         def queries_for(treatment_type) -> BatchDict:
             return queries.map(
                 C.update_in(keys=['image'], func=C.get(treatment_type))
             )
 
-        results = dict(
-            swell=self._benchmark_cbir(
-                queries=queries_for('swell'),
-                cbir=self.cbirs['swell'],
-                ground_truth_cbir=self.ground_truth_cbirs['swell'],
-            ),
-            fracture=self._benchmark_cbir(
-                queries=queries_for('fracture'),
-                cbir=self.cbirs['fracture'],
-                ground_truth_cbir=self.ground_truth_cbirs['fracture'],
-            ),
-        )
+        results = dict()
+        for dataset in ('original', ):  # , 'swell', 'fracture'):
+            results[dataset] = self._benchmark_cbir(
+                queries=queries_for(dataset),
+                cbir=self.cbirs[dataset],
+                ground_truth_cbir=self.ground_truth_cbirs[dataset],
+                full_gallery=(dataset != 'original'),
+            )
 
         return results
 
@@ -566,10 +731,9 @@ class RetrievalExperiment:
             preds = self.ccbir.find_closest_counterfactuals(
                 treatments=query['treatments'],
                 confounders=query['confounders'],
-                observed_factual_images=dissoc(
-                    gt_images,
-                    counterfactual_treatment_type,
-                ),
+                observed_factual_images={
+                    factual_treatment_type: gt_images[factual_treatment_type],
+                },
                 num_samples=num_samples,
                 top_k=None,
             ).dict
@@ -580,6 +744,7 @@ class RetrievalExperiment:
                 target_idxs=target_idxs,
                 ground_truth_idx=target_idxs[0].item(),
                 ground_truth_label=query['ground_truth']['label'].item(),
+                full_gallery=True,
             )
             cumulative_metrics = merge_with(sum, cumulative_metrics, metrics)
 
@@ -587,6 +752,7 @@ class RetrievalExperiment:
 
         return avg_metrics
 
+    @torch.no_grad()
     def benchmark_ccbir(
         self,
         num_queries: int = 1000,
@@ -594,13 +760,13 @@ class RetrievalExperiment:
     ) -> Dict:
         queries = BatchDict(self.data[:num_queries])
         results = dict(
-            swell=self._benchmark_ccbir(
+            factual_swell_counterfactual_fracture=self._benchmark_ccbir(
                 factual_treatment_type='swell',
                 counterfactual_treatment_type='fracture',
                 queries=queries,
                 num_samples=num_samples,
             ),
-            fracture=self._benchmark_ccbir(
+            factual_fracture_counterfactual_swell=self._benchmark_ccbir(
                 factual_treatment_type='fracture',
                 counterfactual_treatment_type='swell',
                 queries=queries,

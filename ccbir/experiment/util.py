@@ -3,6 +3,7 @@ from torch import BoolTensor, LongTensor, Tensor
 from torchmetrics.functional import (
     retrieval_normalized_dcg,
     retrieval_average_precision,
+    precision_recall_curve
 )
 from torchvision import transforms
 from typing import Dict, Iterable, Literal, Optional, Set
