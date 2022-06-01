@@ -63,7 +63,7 @@ class SwellFractureVQVAE_ExperimentData(ExperimentData):
         super().__init__(
             datamodule_ctor=partial(
                 VQVAE_MorphoMNIST_DataModule,
-                datataset=SwellFractureVQVAE_Dataset,
+                dataset_type=SwellFractureVQVAE_Dataset,
             )
         )
 

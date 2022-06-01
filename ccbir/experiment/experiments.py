@@ -1,6 +1,10 @@
 import numpy as np
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import seaborn as sns
 from sklearn.metrics import PrecisionRecallDisplay, average_precision_score
 from sympy import sequence
+from ccbir.models.vqvae.vq_new import ProductQuantizer
 from ccbir.data.morphomnist.dataset import (
     FracturedMorphoMNIST,
     SwollenMorphoMNIST
@@ -11,7 +15,7 @@ from ccbir.experiment.util import avg_precision, hit_rate, ndcg, plot_tsne, reci
 from ccbir.inference.engine import SwollenFracturedMorphoMNIST_Engine
 from ccbir.models.twinnet.model import PSFTwinNet
 from ccbir.models.twinnet.train import vqvae_embed_image
-from ccbir.models.vqvae.model import VQVAE
+from ccbir.models.vqvae.model import VQVAE, VectorQuantizer
 from ccbir.retrieval.cbir import (
     CBIR,
     SSIM_CBIR,
@@ -42,12 +46,66 @@ class VQVAEExperiment:
     def __init__(self, vqvae: VQVAE):
         self.vqvae = vqvae
         self.device = vqvae.device
-        self.data = SwellFractureVQVAE_ExperimentData()
+        # SwellFractureVQVAE_ExperimentData()
+        self.data = OriginalMNIST_VQVAE_ExperimentData()
 
         # TODO: hacky - this should not be needed in VQVAE experiments
         self.twinnet_data = TwinNetExperimentData(
             embed_image=partial(vqvae_embed_image, vqvae),
         )
+
+    def show_quantizer_codewords(
+        self,
+        visualizer: Literal['tsne', 'pca'] = 'pca',
+        tsne_perplexity: Optional[int] = None,
+    ):
+        if hasattr(self.vqvae.vq, 'vqs'):
+            vqs = self.vqvae.vq.vqs
+        else:
+            vqs = [self.vqvae.vq]
+
+        for vq in vqs:
+            codebook: Tensor = vq._codebook.embed
+            if visualizer == 'tsne':
+
+                perplexity = (
+                    tsne_perplexity if tsne_perplexity is not None else
+                    vq.codebook_size // vq._codebook.inject_noise_rings
+                )
+                visualizer_ = TSNE(perplexity=perplexity)
+            elif visualizer == 'pca':
+                visualizer_ = PCA(n_components=2)
+            else:
+                raise RuntimeError(f'Unsupported {visualizer=}')
+            colors = np.arange(len(codebook))
+            latents = visualizer_.fit_transform(codebook.detach().numpy())
+            df = pd.DataFrame(dict(
+                color=colors,
+                x=latents[:, 0],
+                y=latents[:, 1],
+            ))
+            fig = plt.figure(dpi=200)
+            # sns.set_style('white')
+            cmap = 'viridis'
+            g = sns.scatterplot(
+                data=df,
+                x='x',
+                y='y',
+                hue='color',
+                # legend='full',
+                palette=cmap,
+            )
+            g.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+            #g.set(title=f"TSNE: {tsne_perplexity=}")
+            norm = plt.Normalize(0, len(codebook))
+            sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+            sm.set_array([])
+            # Remove the legend and add a colorbar
+            g.get_legend().remove()
+            g.figure.colorbar(sm)
+            g.set_xlabel(None)
+            g.set_ylabel(None)
+            plt.show()
 
     def show_vqvae_recons(
         self,

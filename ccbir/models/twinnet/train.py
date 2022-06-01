@@ -1,24 +1,26 @@
 from ccbir.configuration import config
 config.pythonpath_fix()
-import torch.multiprocessing
-import torch
-from torch import Tensor
-from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.utilities.cli import LightningCLI
-from pytorch_lightning.callbacks import ModelCheckpoint
-from functools import partial
-from ccbir.util import maybe_unbatched_apply, tune_lr
-from ccbir.models.vqvae.model import VQVAE
-from ccbir.models.util import load_best_model
-from ccbir.models.twinnet.model import PSFTwinNet
 from ccbir.models.twinnet.data import PSFTwinNetDataModule
+from ccbir.models.twinnet.model import PSFTwinNet
+from ccbir.models.util import load_best_model
+from ccbir.models.vqvae.model import VQVAE
+from ccbir.util import maybe_unbatched_apply, split_apply_cat, tune_lr
+from functools import partial
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.utilities.cli import LightningCLI
+from pytorch_lightning.loggers import TensorBoardLogger
+from torch import Tensor
+import torch
+import torch.multiprocessing
 
 
-def vqvae_embed_image(vqvae: VQVAE, image: Tensor):
+def vqvae_embed_image(vqvae: VQVAE, image: Tensor) -> Tensor:
     embed = partial(vqvae.embed, latent_type='decoder_input')
+    embed = split_apply_cat(embed)
+    embed = maybe_unbatched_apply(embed)
 
     with torch.no_grad():
-        return maybe_unbatched_apply(embed, image)
+        return embed(image.to(vqvae.device)).to(image.device)
 
 
 def main():
@@ -64,7 +66,7 @@ def main():
             ],
             max_epochs=5000,
             gpus=1,
-            #profiler='advanced',
+            # profiler='advanced',
         ),
     )
 

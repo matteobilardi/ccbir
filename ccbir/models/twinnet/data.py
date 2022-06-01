@@ -1,6 +1,6 @@
 from ccbir.configuration import config
 from ccbir.data.util import BatchDict, random_split_repeated
-from ccbir.data.morphomnist.datamodule import MorphoMNISTDataModule
+from ccbir.data.morphomnist.datamodule import MorphoMNIST_DataModule
 from ccbir.data.morphomnist.dataset import FracturedMorphoMNIST, PlainMorphoMNIST, SwollenMorphoMNIST
 from functools import partial
 from more_itertools import all_equal
@@ -28,7 +28,7 @@ class PSFTwinNetDataset(Dataset):
         *,
         embed_image: Callable[[Tensor], Tensor],
         train: bool,
-        repeats: int = 2,
+        repeats: int,
         transform: Callable[[BatchDict], BatchDict] = None,
         normalize_metrics: bool = True,
         normalize_perturbation_data: bool = False,
@@ -261,7 +261,7 @@ class PSFTwinNetDataset(Dataset):
         ])
 
 
-class PSFTwinNetDataModule(MorphoMNISTDataModule):
+class PSFTwinNetDataModule(MorphoMNIST_DataModule):
     # TODO: better class name
     def __init__(
         self,
@@ -269,10 +269,12 @@ class PSFTwinNetDataModule(MorphoMNISTDataModule):
         embed_image: Callable[[Tensor], Tensor],
         batch_size: int = 512,
         pin_memory: bool = True,
+        repeats: int = 2,
         **kwargs,
     ):
+        cache_folder = f"{self.__class__.__name__.lower()}_repeats{repeats}"
         self.shared_cache = diskcache.Index(
-            str(config.temporary_data_path / self.__class__.__name__.lower())
+            str(config.temporary_data_path / cache_folder)
         )
 
         super().__init__(
@@ -280,6 +282,7 @@ class PSFTwinNetDataModule(MorphoMNISTDataModule):
                 PSFTwinNetDataset,
                 embed_image=embed_image,
                 shared_cache=self.shared_cache,
+                repeats=repeats,
             ),
             batch_size=batch_size,
             pin_memory=pin_memory,

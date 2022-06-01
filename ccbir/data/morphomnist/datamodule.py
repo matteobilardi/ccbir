@@ -11,7 +11,7 @@ import torch
 from typing import Type, Union
 
 
-class MorphoMNISTDataModule(pl.LightningDataModule):
+class MorphoMNIST_DataModule(pl.LightningDataModule):
     def __init__(
         self,
         *,

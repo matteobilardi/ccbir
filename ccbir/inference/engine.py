@@ -5,7 +5,7 @@ from ccbir.data.util import BatchDict
 from ccbir.models.twinnet.model import PSFTwinNet, TwinNet
 from ccbir.util import star_apply
 from einops import rearrange, repeat, reduce
-from functools import cached_property, partial
+from functools import partial
 from toolz import keyfilter, merge_with, valmap
 from torch import Tensor
 from typing import Dict, Optional
@@ -56,6 +56,7 @@ class InferenceEngine(ABC):
             torch.stack(list(distance_from_factual_outcome.values()))
             .mean(dim=0)
         )
+        assert distance.shape[0] == len(sampled_outcomes)
 
         _, top_k_idxs = torch.topk(distance, k=top_k, largest=False)
         top_k_sampled_outcomes = BatchDict(sampled_outcomes[top_k_idxs])

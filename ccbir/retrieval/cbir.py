@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from functools import partial
-from ccbir.util import maybe_unbatched_apply
+from ccbir.util import maybe_unbatched_apply, split_apply_cat
 from ccbir.data.morphomnist.dataset import SwollenMorphoMNIST
 from ccbir.data.util import BatchDict
 from ccbir.models.util import load_best_model
@@ -107,5 +107,6 @@ class VQVAE_CBIR(CBIR):
         return self.vqvae.vq.latents_distance(embedding1, embedding2)
 
     def extract_embedding(self, image: Tensor) -> Tensor:
+        encode = maybe_unbatched_apply(split_apply_cat(self.vqvae.encode))
         with torch.no_grad():
-            return maybe_unbatched_apply(self.vqvae.encode, image)
+            return encode(image)

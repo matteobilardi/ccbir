@@ -118,7 +118,7 @@ class MorphoMNIST(Dataset):
         assert self.train
         return random_split_repeated(
             dataset=self,
-            train_ration=train_ratio,
+            train_ratio=train_ratio,
             repeats=1,
             generator=generator
         )
@@ -385,6 +385,14 @@ class PerturbedMorphoMNIST(MorphoMNIST):
             index_label='index'
         )
 
+
+class OriginalMNIST(MorphoMNIST):
+    def __init__(
+        self,
+        data_dir: str = str(config.original_mnist_data_path),
+        **kwargs,
+    ):
+        super().__init__(data_dir=data_dir, **kwargs)
 
 class PlainMorphoMNIST(MorphoMNIST):
     def __init__(

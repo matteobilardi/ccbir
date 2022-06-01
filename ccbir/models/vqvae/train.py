@@ -1,6 +1,6 @@
 from ccbir.configuration import config
 config.pythonpath_fix()
-from ccbir.models.vqvae.data import VQVAEMorphoMNISTDataModule
+from ccbir.models.vqvae.data import VQVAE_MorphoMNIST_DataModule
 from ccbir.models.vqvae.model import VQVAE
 from pytorch_lightning.loggers import TensorBoardLogger
 
@@ -11,7 +11,7 @@ def main():
 
     cli = LightningCLI(
         VQVAE,
-        VQVAEMorphoMNISTDataModule,
+        VQVAE_MorphoMNIST_DataModule,
         save_config_overwrite=True,
         run=False,  # deactivate automatic fitting
         trainer_defaults=dict(
@@ -28,7 +28,7 @@ def main():
                 )
             ],
             max_epochs=3000,
-            gpus=1,
+            gpus=[1],
         ),
     )
     cli.trainer.fit(cli.model, datamodule=cli.datamodule)

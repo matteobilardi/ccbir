@@ -5,7 +5,7 @@ from more_itertools import all_equal, first, interleave_evenly
 from sklearn.preprocessing import StandardScaler
 from toolz import valmap, curry, compose, do, identity
 from torch.utils.data import Dataset, default_collate, default_convert, Subset
-from typing import Any, Callable, Dict, Generator, Generic, Hashable, List, Mapping, Sequence, Tuple, TypeVar, Union
+from typing import Any, Callable, Dict, Generator, Generic, Hashable, Iterable, List, Mapping, Sequence, Tuple, TypeVar, Union
 from typing_extensions import Self
 import numpy as np
 import pandas as pd

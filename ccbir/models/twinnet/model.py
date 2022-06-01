@@ -91,7 +91,7 @@ class TwinNet(pl.LightningModule):
         vqvae: VQVAE,
         weight_sharing: bool = False,
         activation: ActivationFunc = 'mish',
-        batch_norm: bool = False, # TODO remove
+        batch_norm: bool = False,  # TODO remove
     ):
         super().__init__()
         kwargs = dict(
@@ -271,7 +271,7 @@ class PSFTwinNet(TwinNet):
             treatment_dim=PSFTwinNetDataset.treatment_dim(),
             confounders_dim=PSFTwinNetDataset.confounders_dim(),
             # FIXME: change dataset
-            outcome_noise_dim=8,  # 16,  # 32,  # PSFTwinNetDataset.outcome_noise_dim,
+            outcome_noise_dim=16,#16, #16,  # 12,  # 8,  # 16,  # 32,  # PSFTwinNetDataset.outcome_noise_dim,
             lr=lr,
             encoder_lr=encoder_lr,
             vqvae=vqvae,
