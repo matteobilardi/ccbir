@@ -107,14 +107,14 @@ class VQVAE_Engine(InferenceEngine):
         outcome_samples: Tensor,
         outcome_target: Tensor,
     ) -> Tensor:
-        if outcome_samples.dim() == 2:
+        if outcome_samples.dim() == 1:
             outcome_samples = outcome_samples.unsqueeze(0)
 
         assert outcome_samples.dim() == outcome_target.dim() + 1
         num_samples = outcome_samples.shape[0]
         outcome_targets = repeat(
             tensor=outcome_target,
-            pattern='h w -> s h w',
+            pattern='... -> s ...',
             s=num_samples,
         )
 

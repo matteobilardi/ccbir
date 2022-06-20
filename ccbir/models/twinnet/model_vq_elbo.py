@@ -9,7 +9,7 @@ from ccbir.models.twinnet.arch import (
     DeepTwinNetNoiseEncoder,
 )
 from ccbir.models.util import load_best_model
-from ccbir.models.vqvae.model import VQVAE
+from ccbir.models.vqvae.model_vq import VQVAE
 from ccbir.data.util import BatchDictLike
 from ccbir.models.twinnet.data import PSFTwinNetDataset
 from ccbir.util import ActivationFunc, activation_layer_ctor
@@ -18,6 +18,7 @@ from torch import Tensor
 from typing import Dict, Literal, Optional, Tuple
 import torch
 from toolz import dissoc, keymap
+from pyro.poutine.trace_struct import Trace
 
 
 class V:
@@ -96,6 +97,7 @@ class CustomELBO(pyro.infer.TraceMeanField_ELBO):
             **guide_metrics,
             f"KL(q({V.outcome_noise})||p({V.outcome_noise}))": kl,
         }
+
 
 class TwinNet(pl.LightningModule):
     def __init__(
@@ -291,20 +293,18 @@ class TwinNet(pl.LightningModule):
 class PSFTwinNet(TwinNet):
     def __init__(
         self,
+        vqvae: VQVAE,
         outcome_size: torch.Size,
         lr: float = 0.0002,
         encoder_lr: float = 0.0002,
-        vqvae: Optional[VQVAE] = None,
     ):
-        if vqvae is None:
-            vqvae = load_best_model(VQVAE)
-
         super().__init__(
             outcome_size=outcome_size,
             treatment_dim=PSFTwinNetDataset.treatment_dim(),
             confounders_dim=PSFTwinNetDataset.confounders_dim(),
             # FIXME: change dataset
-            outcome_noise_dim=16,#16, #16,  # 12,  # 8,  # 16,  # 32,  # PSFTwinNetDataset.outcome_noise_dim,
+            # 16, #16,  # 12,  # 8,  # 16,  # 32,  # PSFTwinNetDataset.outcome_noise_dim,
+            outcome_noise_dim=16,
             lr=lr,
             encoder_lr=encoder_lr,
             vqvae=vqvae,

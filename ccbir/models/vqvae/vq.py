@@ -142,9 +142,9 @@ class BasicCodebook(EuclideanCodebook):
         output = dict()
         if self.inject_noise and self.training:
             embed_idxs_noisy = self._inject_noise(embed_idxs)
-            #embed_onehot_ema_clean = (
+            # embed_onehot_ema_clean = (
             #    F.one_hot(embed_idxs, self.codebook_size).type(dtype)
-            #)
+            # )
             embed_onehot_ema = (
                 F.one_hot(embed_idxs_noisy, self.codebook_size).type(dtype)
             )

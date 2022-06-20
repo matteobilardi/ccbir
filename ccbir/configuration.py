@@ -73,7 +73,9 @@ class Config:
 
     @property
     def temporary_data_path(self) -> Path:
-        return _mkdir_if_missing(Path('/vol/bitbucket/mb8318/ccbir/tmp'))
+        #return _mkdir_if_missing(Path('/vol/bitbucket/mb8318/ccbir/tmp'))
+        return _mkdir_if_missing(Path('/vol/bitbucket/mb8318/ccbir/tmp_vq'))
+        #return _mkdir_if_missing(Path('/vol/bitbucket/mb8318/ccbir/tmp_pq_cos_large'))
 
     @property
     def logs_path(self) -> Path:

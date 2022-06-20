@@ -34,9 +34,9 @@ def optimal_sigma(
     Note that variance is calculated across all datapoints in the batch as is
     done in the sigma-vae paper."""
     assert estimate_batch.shape == target_batch.shape
-    return (
+    sigma_scalar = (
         ((estimate_batch - target_batch) ** 2)
-        .mean(dim=[0, 1, 2, 3], keepdim=True)
+        .mean()
         .sqrt()
-        .expand_as(estimate_batch)
     )
+    return sigma_scalar.expand_as(estimate_batch), sigma_scalar

@@ -2,8 +2,9 @@ from functools import partial
 from multiprocessing.sharedctypes import Value
 from pathlib import Path
 from typing import Any, Callable, Dict, Hashable, Iterable, List, Literal, Optional, Sequence, TypeVar, Union
+from more_itertools import all_equal
 from torch import Tensor
-from toolz import curry, valmap, merge_with, identity
+from toolz import curry, valmap, merge_with, concat
 import toolz.curried as C
 import pytorch_lightning as pl
 import matplotlib.pyplot as plt
@@ -41,8 +42,13 @@ T = TypeVar('T')
 
 
 @curry
-def star_apply(func: Callable[..., T], arg: Iterable) -> T:
-    return func(*arg)
+def star_apply(func: Callable[..., T], args: Iterable) -> T:
+    return func(*args)
+
+
+@curry
+def apply(func: Callable[..., T], *args, **kwargs) -> T:
+    return func(*args, **kwargs)
 
 
 @curry
@@ -221,9 +227,27 @@ def array_like_ncycles(array_like: A, n: int) -> A:
 def split_apply_cat(
     func: Callable[[Tensor], Tensor],
     input: Tensor,
-    split_size=1024,
+    split_size=2048,
 ) -> Tensor:
     """Assumes that func works on batches and input is batched. Used to reduce
     memory consumption of calling func on a very large batched input and avoid
     out-of-memory errors."""
     return torch.cat(tuple(map(func, torch.split(input, split_size))))
+
+
+def cat(dicts_or_sequences):
+    dicts = all(map(lambda d: isinstance(d, dict), dicts_or_sequences))
+    if dicts:
+        return merge_with(cat, *dicts_or_sequences)
+    else:
+        sequences = dicts_or_sequences
+        assert all_equal(map(type, sequences))
+        seq1 = sequences[0]
+        if isinstance(seq1, Tensor):
+            return torch.cat(sequences)
+        elif isinstance(seq1, np.ndarray):
+            return np.concatenate(sequences)
+        elif isinstance(seq1, list):
+            return list(concat(sequences))
+        else:
+            raise TypeError(f"Unsupported type {type(seq1)}")

@@ -22,7 +22,7 @@ from ccbir.retrieval.cbir import (
     SSIM_CBIR,
     VQVAE_CBIR,
 )
-from ccbir.retrieval.ccbir import CCBIR, ELBO_CCBIR
+from ccbir.retrieval.ccbir import CCBIR
 from ccbir.util import leaves_map, maybe_unbatched_apply, star_apply
 from functools import partial
 from more_itertools import all_equal, interleave, unzip
@@ -201,19 +201,6 @@ class PSFTwinNetExperiment:
                 single_item_dims=1,
             ).to(latent.device)
 
-    def show_dataset(self, start: int, end: int, train=False):
-        assert start < end
-        psf_item = self.data.psf_items(train, slice(start, end))
-        swollen_images = psf_item['swollen']['image']
-        fractured_images = psf_item['fractured']['image']
-        images = torch.cat((swollen_images, fractured_images))
-        show_tensor(make_grid(
-            tensor=images,
-            nrow=len(swollen_images),
-            normalize=True,
-            value_range=(-1, 1),
-        ))
-
     def prepare_query(
         self,
         item_idx: int,
@@ -244,22 +231,17 @@ class PSFTwinNetExperiment:
             )
 
             if include_ground_truth_strip:
-                """
                 ground_truths = torch.stack((
-                    # original_image,
+                    original_image,
                     swollen_image,
-                    # self.decode(swollen_embedding),
+                    self.decode(swollen_embedding),
                     fractured_image,
-                    # self.decode(fractured_embedding),
+                    self.decode(fractured_embedding),
                 ))
-                """
-                ground_truths = torch.stack((swollen_image, fractured_image))
 
                 ground_truth_strip = make_grid(
-                    nrow=1,
                     tensor=ground_truths,
                     normalize=True,
-                    # pad_value=1,
                     value_range=(-1, 1),
                 )
                 metadata['ground_truth_strip'] = ground_truth_strip
@@ -294,7 +276,7 @@ class PSFTwinNetExperiment:
             include_metadata=True,
             include_ground_truth_strip=False,
         )
-
+        
         dataset_len = len(self.data.dataset(train=train))
         if max_items is None:
             num_items = dataset_len
@@ -413,36 +395,19 @@ class PSFTwinNetExperiment:
 
         # make the swollen and fractured embedding sampled from the same input
         # and noise show up one after the other to ease visual inspection
-        # paired_up_embeddings = torch.stack(list(
-        #    interleave(swollen_embedding_hat, fractured_embedding_hat)
-        # ))
-        embeddings = torch.cat((
-            swollen_embedding_hat,
-            fractured_embedding_hat,
+        paired_up_embeddings = torch.stack(list(
+            interleave(swollen_embedding_hat, fractured_embedding_hat)
         ))
+
         # paired up images sampled via the twinnet
-        images = self.decode(embeddings)
-
-        #swollen_images_hat = self.decode(swollen_embedding_hat)
-        #fractured_images_hat = self.decode(fractured_embedding_hat)
-        #images = torch.stack((*swollen_images_hat, *fractured_images_hat))
-
-        """
-        images = list(
-            map(
-                partial(torch.cat, dim=1),
-                zip(swollen_images_hat, fractured_images_hat),
-            )
-        )"""
+        images_hat = self.decode(paired_up_embeddings)
 
         show_tensor(metadata['ground_truth_strip'])
         show_tensor(
             make_grid(
-                tensor=images,
+                tensor=images_hat,
                 normalize=True,
                 value_range=(-1, 1),
-                nrow=len(images) // 2,
-                # pad_value=1,
             ),
             dpi=dpi,
         )
@@ -478,7 +443,6 @@ class RetrievalExperiment:
         vqvae: VQVAE,
         vqvae_original_mnist: VQVAE,
         twinnet: PSFTwinNet,
-        elbo_ccbir: bool = False,
         #     num_images: int = -1,  # include all images by default
     ):
         assert all_equal((
@@ -518,22 +482,13 @@ class RetrievalExperiment:
                 vqvae=vqvae_original_mnist,
             ),
         )
-
-        cbir_for_treatment_type = dissoc(self.cbirs, 'original')
-
-        if elbo_ccbir:
-            self.ccbir = ELBO_CCBIR(
+        self.ccbir = CCBIR(
+            inference_engine=SwollenFracturedMorphoMNIST_Engine(
+                vqvae=vqvae,
                 twinnet=twinnet,
-                cbir_for_treatment_type=cbir_for_treatment_type,
-            )
-        else:
-            self.ccbir = CCBIR(
-                inference_engine=SwollenFracturedMorphoMNIST_Engine(
-                    vqvae=vqvae,
-                    twinnet=twinnet,
-                ),
-                cbir_for_treatment_type=cbir_for_treatment_type,
-            )
+            ),
+            cbir_for_treatment_type=dissoc(self.cbirs, 'original'),
+        )
 
     def _load_queries_and_gallery_data(
         self,
@@ -676,8 +631,7 @@ class RetrievalExperiment:
             self.queries_data
             [query_idx]['ground_truth']['image'][treatment_type]
         )
-        show_tensor(make_grid([image], normalize=True,
-                    value_range=(-1, 1)), dpi=50)
+        show_tensor(image, dpi=50)
         images, _idxs = cbir.find_closest(image, top_k=top_k)
         show_tensor(
             make_grid(tensor=images, normalize=True, value_range=(-1, 1))
@@ -689,50 +643,30 @@ class RetrievalExperiment:
         factual_treatment_type: Literal['swell', 'fracture'],
         counterfactual_treatment_type: Literal['swell', 'fracture'],
         top_k: int = 64,
-        num_samples: int = 2 ** 14,
-        check_correct: bool = False,
     ):
         factual_treatment_type != counterfactual_treatment_type
 
         query = self.queries_data[query_idx]
-        gt_images = query['ground_truth']['image']
-        for img in gt_images.values():
-            show_tensor(
-                make_grid(
-                    tensor=[img],
-                    normalize=True,
-                    value_range=(-1, 1),
-                ),
-                dpi=50,
-                save=True,
-            )
+        images = query['ground_truth']['image']
+        for img in images.values():
+            show_tensor(img, dpi=50)
 
         observed_factual_images = {
-            factual_treatment_type: gt_images[factual_treatment_type],
+            factual_treatment_type: images[factual_treatment_type],
         }
 
-        images, _idxs = self.ccbir.find_closest_counterfactuals(
+        results = self.ccbir.find_closest_counterfactuals(
             treatments=query['treatments'],
             confounders=query['confounders'],
             observed_factual_images=observed_factual_images,
-            factual_treatment_type=factual_treatment_type,
-            counterfactual_treatment_type=counterfactual_treatment_type,
-            num_samples=num_samples,
             top_k=top_k,
-        )
+        ).dict
 
-        if check_correct:
-            assert images[0].allclose(gt_images[counterfactual_treatment_type])
+        images, _idxs = results[counterfactual_treatment_type]
 
         show_tensor(
-            make_grid(
-                tensor=images,
-                nrow=len(images),
-                normalize=True,
-                value_range=(-1, 1)
-            ),
+            make_grid(tensor=images, normalize=True, value_range=(-1, 1)),
             dpi=250,
-            save=True,
         )
 
     @memoize
@@ -836,7 +770,7 @@ class RetrievalExperiment:
 
         results = dict()
         for dataset in ('swell', 'fracture'):
-            #for dataset in ('original',):  #
+        #for dataset in ('original',):  #
             results[dataset] = self._benchmark_cbir(
                 queries=queries_for(dataset),
                 cbir=self.cbirs[dataset],
@@ -867,17 +801,16 @@ class RetrievalExperiment:
             )
             assert torch.allclose(gt_image_star, target_images[0])
 
-            _images, pred_idxs = self.ccbir.find_closest_counterfactuals(
+            preds = self.ccbir.find_closest_counterfactuals(
                 treatments=query['treatments'],
                 confounders=query['confounders'],
                 observed_factual_images={
                     factual_treatment_type: gt_images[factual_treatment_type],
                 },
-                factual_treatment_type=factual_treatment_type,
-                counterfactual_treatment_type=counterfactual_treatment_type,
                 num_samples=num_samples,
                 top_k=None,
-            )
+            ).dict
+            _pred_images, pred_idxs = preds[counterfactual_treatment_type]
 
             metrics = self._query_metrics(
                 pred_idxs=pred_idxs,

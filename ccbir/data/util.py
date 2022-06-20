@@ -1,4 +1,5 @@
 from __future__ import annotations
+from functools import partial
 from itertools import starmap, repeat
 import math
 from more_itertools import all_equal, first, interleave_evenly
@@ -13,7 +14,7 @@ import toolz.curried as C
 import torch
 from torch import Tensor, default_generator
 
-from ccbir.util import NestedDict, array_like_ncycles, numpy_ncycles, leaves_map, strict_update_in, tensor_ncycles
+from ccbir.util import NestedDict, array_like_ncycles, cat, numpy_ncycles, leaves_map, strict_update_in, tensor_ncycles
 
 BatchDictLike = NestedDict[Hashable, Sequence]
 
@@ -50,6 +51,20 @@ class BatchDict:
     def map(self, func: Callable[[BatchDictLike], BatchDictLike]) -> Self:
         return self.__class__(func(self.dict))
 
+    def split_map_cat(
+        self,
+        func: Callable[[BatchDictLike], BatchDictLike],
+        split_size: int = 2048
+    ) -> Self:
+        def _check_tensor(sequence):
+            assert isinstance(sequence, Tensor)
+        leaves_map(_check_tensor, self.dict)
+        split_features = self.map_features(lambda t: t.split(split_size))
+        mapped_split_features = list(map(func, split_features.iter_rows()))
+        mapped_features = cat(mapped_split_features)
+        return BatchDict(mapped_features)
+
+
     def map_features(self, func: Callable[[Sequence], Sequence]) -> Self:
         return self.map(leaves_map(func))
 
@@ -81,6 +96,7 @@ class BatchDict:
         lengths = []
         _ = leaves_map(compose(lengths.append, len), features, strict=False)
         return lengths
+
 
 
 class InterleaveDataset(Dataset):

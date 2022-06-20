@@ -1,4 +1,7 @@
+import datetime
+from random import random
 from sklearn.manifold import TSNE
+from sympy import interpolate
 from torch import BoolTensor, LongTensor, Tensor
 from torchmetrics.functional import (
     retrieval_normalized_dcg,
@@ -11,6 +14,12 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 import torch
+import torchvision.transforms.functional as F
+import numpy as np
+from torchvision.utils import save_image
+import random
+
+from ccbir.configuration import config
 
 
 def pil_from_tensor(tensor):
@@ -21,8 +30,33 @@ def tensor_from_pil(img):
     return transforms.ToTensor()(img)
 
 
-def show_tensor(tensor_img, dpi=150):
-    plt.figure(dpi=dpi)
+def show_tensor(imgs, dpi=150, invert_colors=True, save=False):
+    #plt.rcParams["savefig.bbox"] = 'tight'
+    if not isinstance(imgs, list):
+        imgs = [imgs]
+    fix, axs = plt.subplots(ncols=len(imgs), squeeze=False)
+    for i, img in enumerate(imgs):
+        img = img.detach()
+        if invert_colors:
+            img = F.invert(img)
+
+        if save:
+            rand_str = str(random.randint(0, 1000))
+            time = datetime.datetime.now().strftime('%y%m%d_%H%M%S')
+            dir = config.temporary_data_path / 'pics'
+            dir.mkdir(parents=True, exist_ok=True)
+            file = dir / f"image_{time}_{rand_str}.png"
+            save_image(img, file)
+
+        img = F.to_pil_image(img)
+        axs[0, i].set_axis_off()
+        #axs[0, i].matshow(np.asarray(img))
+        axs[0, i].imshow(np.asarray(img), interpolation='none')
+        axs[0, i].set(xticklabels=[], yticklabels=[], xticks=[], yticks=[])
+
+
+def _show_tensor(tensor_img, dpi=150):
+    fig = plt.figure(dpi=dpi)
     plt.imshow(pil_from_tensor(tensor_img), cmap='gray', vmin=0, vmax=255)
 
 

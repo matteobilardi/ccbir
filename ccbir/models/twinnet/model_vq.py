@@ -9,7 +9,7 @@ from ccbir.models.twinnet.arch import (
     DeepTwinNetNoiseEncoder,
 )
 from ccbir.models.util import load_best_model
-from ccbir.models.vqvae.model import VQVAE
+from ccbir.models.vqvae.model_vq import VQVAE
 from ccbir.data.util import BatchDictLike
 from ccbir.models.twinnet.data import PSFTwinNetDataset
 from ccbir.util import ActivationFunc, activation_layer_ctor
@@ -50,25 +50,6 @@ class CustomELBO(pyro.infer.TraceMeanField_ELBO):
 
         return model_trace, guide_trace
 
-    def get_batched_elbo(
-        self,
-    ) -> Tensor:
-        model = self.trace_storage['model']
-        guide = self.trace_storage['guide']
-        model_log_probs = []
-        for var, site in model.nodes.items():
-            if site['type'] == 'sample':
-                model_log_probs.append(site['fn'].log_prob(site['value']))
-
-        guide_log_probs = []
-        for site in guide.nodes.values():
-            if site['type'] == 'sample':
-                guide_log_probs.append(site['fn'].log_prob(site['value']))
-
-        elbo = sum(model_log_probs) - sum(guide_log_probs)
-
-        return elbo
-
     def get_metrics(self) -> Dict:
         model = self.trace_storage['model']
         guide = self.trace_storage['guide']
@@ -96,6 +77,7 @@ class CustomELBO(pyro.infer.TraceMeanField_ELBO):
             **guide_metrics,
             f"KL(q({V.outcome_noise})||p({V.outcome_noise}))": kl,
         }
+
 
 class TwinNet(pl.LightningModule):
     def __init__(
@@ -244,21 +226,6 @@ class TwinNet(pl.LightningModule):
         test_metrics = keymap('test/'.__add__, metrics)
         self.log_dict(test_metrics, on_epoch=True)
 
-    def eval_elbo(
-        self,
-        batch: Tuple[BatchDictLike, BatchDictLike],
-        num_samples: int,
-    ) -> Tensor:
-        svi_loss = CustomELBO(num_particles=num_samples)
-        svi = pyro.infer.SVI(
-            model=self.model,
-            guide=self.guide,
-            optim=pyro.optim.Adam({}),
-            loss=svi_loss,
-        )
-        _ = svi.evaluate_loss(batch)
-        return svi_loss.get_batched_elbo()
-
     def _step(
         self,
         batch: Tuple[BatchDictLike, BatchDictLike],
@@ -291,14 +258,11 @@ class TwinNet(pl.LightningModule):
 class PSFTwinNet(TwinNet):
     def __init__(
         self,
+        vqvae: VQVAE,
         outcome_size: torch.Size,
         lr: float = 0.0002,
         encoder_lr: float = 0.0002,
-        vqvae: Optional[VQVAE] = None,
     ):
-        if vqvae is None:
-            vqvae = load_best_model(VQVAE)
-
         super().__init__(
             outcome_size=outcome_size,
             treatment_dim=PSFTwinNetDataset.treatment_dim(),

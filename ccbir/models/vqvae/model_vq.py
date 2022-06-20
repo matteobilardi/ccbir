@@ -1,97 +1,15 @@
-from einops import rearrange, reduce
+from einops.layers.torch import Rearrange
 from ccbir.arch import PreActResBlock
 from ccbir.util import ActivationFunc, activation_layer_ctor
+from ccbir.models.vqvae.vq import ProductQuantizer, VectorQuantizer
 from functools import cached_property, partial
 import pytorch_lightning as pl
 from torch import LongTensor, Tensor, nn
-from typing import Callable, Literal
+from typing import Callable, Literal, Union
 import torch
 import torch.nn.functional as F
 from vector_quantize_pytorch import VectorQuantize
 from toolz import keymap
-
-
-class VectorQuantizer(VectorQuantize):
-    def __init__(
-        self,
-        dim,
-        codebook_size,
-        n_embed=None,
-        codebook_dim=None,
-        decay=0.99,
-        eps=0.00001,
-        kmeans_init=False,
-        kmeans_iters=10,
-        use_cosine_sim=False,
-        threshold_ema_dead_code=0,
-        channel_last=True,
-        accept_image_fmap=False,
-        commitment_weight=None,
-        commitment=1,
-        orthogonal_reg_weight=0,
-        orthogonal_reg_active_codes_only=False,
-        orthogonal_reg_max_codes=None,
-        sample_codebook_temp=0,
-        sync_codebook=False
-    ):
-        super().__init__(
-            dim,
-            codebook_size,
-            n_embed,
-            codebook_dim,
-            decay,
-            eps,
-            kmeans_init,
-            kmeans_iters,
-            use_cosine_sim,
-            threshold_ema_dead_code,
-            channel_last,
-            accept_image_fmap,
-            commitment_weight,
-            commitment,
-            orthogonal_reg_weight,
-            orthogonal_reg_active_codes_only,
-            orthogonal_reg_max_codes,
-            sample_codebook_temp,
-            sync_codebook,
-        )
-
-    def quantize_encoding(
-        self,
-        encoding: Tensor
-    ) -> Tensor:
-        _b, h, w = encoding.shape
-        encoding_idxs = rearrange(encoding, 'b h w -> b (h w)')
-        quantized = F.embedding(encoding_idxs, self._codebook.embed)
-        if self.accept_image_fmap:
-            quantized = rearrange(quantized, 'b (h w) c -> b c h w', h=h, w=w)
-
-        return quantized
-
-    @cached_property
-    def _distance_matrix(self) -> Tensor:
-        codewords = self.codebook.unsqueeze(0)
-        print('Pre-computing codebook distances')
-        distances = torch.cdist(codewords, codewords, p=2).squeeze(0)
-        print('Precomputed codebook distances')
-
-        return distances
-
-    def latents_distance(
-        self,
-        latent1: Tensor,  # B x *
-        latent2: Tensor,  # B x *
-    ) -> Tensor:  # B
-        """Distance between discrete latents (of size B x *) computed as the MSE
-        between the corresponding quantized tensors (of size B x * x D)"""
-        assert latent1.shape == latent2.shape
-        flatten = partial(rearrange, pattern='b ... -> b (...)')
-        idxs1 = flatten(latent1)
-        idxs2 = flatten(latent2)
-        distances = self._distance_matrix[idxs1, idxs2]
-        distance = reduce(distances, 'b n -> b', 'mean')
-
-        return distance
 
 
 class VQVAEComponent(nn.Module):
@@ -108,7 +26,7 @@ class VQVAEComponent(nn.Module):
         super().__init__()
         C = in_channels
         W = width_scale
-        L = latent_dim
+        D = latent_dim
 
         resblocks = partial(
             PreActResBlock.multi_block,
@@ -126,22 +44,32 @@ class VQVAEComponent(nn.Module):
             activation(),
             nn.Conv2d(64, 64, 4, 1),
             resblocks(4, 64, 64, activation=activation),
-            nn.Conv2d(64, L, 1),
+            nn.Conv2d(64, D, 1),
+            Rearrange('b d h w -> b (h w) d'),
         )
         self.vq = VectorQuantizer(
             dim=latent_dim,
             codebook_size=codebook_size,
-            use_cosine_sim=True,
-            accept_image_fmap=True,
+            use_cosine_sim=False,
+            accept_image_fmap=False,
             decay=0.99,
             commitment_weight=commitment_cost,
-            threshold_ema_dead_code=2,
+            #threshold_ema_dead_code=0.05 * 8,
+            #inject_noise=True,
+            #inject_noise_sigma=1.0,
+            #inject_noise_rings=1,
+            # negative_sample_weight=0.0,
+            #clean_cluster_size_update=True,
+            #wrap_ring_noise=True,
+            #noise_type='ring',
+            #limit_per_ring_expiry=None,
             # sample_codebook_temp=0.1,
         )
         self.decoder = nn.Sequential(
+            Rearrange('b (h w) d -> b d h w', h=8, w=8),
             # scales 8x8 to 32x32
             nn.Upsample(scale_factor=4, mode='nearest'),
-            nn.Conv2d(L, 64, 3, 1, bias=False),
+            nn.Conv2d(D, 64, 3, 1, bias=False),
             nn.BatchNorm2d(64),
             activation(),
             nn.Conv2d(64, 64, 3, 1, bias=False),
@@ -152,7 +80,7 @@ class VQVAEComponent(nn.Module):
 
     def encode(self, x: Tensor):
         z_e = self.encoder(x)
-        _z_q, e, _loss = self.vq(z_e)
+        _z_q, e, _loss, _metrics = self.vq(z_e)
         return e
 
     def decode(self, discrete_latent: Tensor):
@@ -162,7 +90,7 @@ class VQVAEComponent(nn.Module):
 
     def forward(self, x: Tensor):
         z_e = self.encoder(x)
-        z_q, e, vq_loss = self.vq(z_e)
+        z_q, e, vq_loss, vq_metrics = self.vq(z_e)
         x_recon = self.decoder(z_q)
 
         return dict(
@@ -171,6 +99,7 @@ class VQVAEComponent(nn.Module):
             decoder_input=z_q,
             recon=x_recon,
             vq_loss=vq_loss,
+            vq_metrics=vq_metrics,
         )
 
 
@@ -259,16 +188,16 @@ class VQVAE(pl.LightningModule):
         output = self.model(x)
         x_recon = output['recon']
         vq_loss = output['vq_loss']
+        vq_metrics = output['vq_metrics']
 
         recon_loss = F.mse_loss(x_recon, x)
 
         loss = recon_loss + self.vector_quantizer_strength * vq_loss
-
-        # not reporting loss_commit since it's identical to loss_vq
         metrics = {
             'loss': loss,
             'loss_recon': recon_loss,
             'loss_vq': vq_loss,
+            **vq_metrics,
         }
 
         return loss, metrics

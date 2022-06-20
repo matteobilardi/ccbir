@@ -8,8 +8,8 @@ from ccbir.models.twinnet.arch import (
     DeepTwinNet,
     DeepTwinNetNoiseEncoder,
 )
-from ccbir.models.util import load_best_model
-from ccbir.models.vqvae.model import VQVAE
+from ccbir.models.util import load_best_model, optimal_sigma
+from ccbir.models.vqvae.model_vq import VQVAE
 from ccbir.data.util import BatchDictLike
 from ccbir.models.twinnet.data import PSFTwinNetDataset
 from ccbir.util import ActivationFunc, activation_layer_ctor
@@ -18,6 +18,7 @@ from torch import Tensor
 from typing import Dict, Literal, Optional, Tuple
 import torch
 from toolz import dissoc, keymap
+from vector_quantize_pytorch.vector_quantize_pytorch import ema_inplace
 
 
 class V:
@@ -50,15 +51,17 @@ class CustomELBO(pyro.infer.TraceMeanField_ELBO):
 
         return model_trace, guide_trace
 
-    def get_batched_elbo(
-        self,
-    ) -> Tensor:
+    def get_batched_elbo(self) -> Tensor:
         model = self.trace_storage['model']
         guide = self.trace_storage['guide']
         model_log_probs = []
         for var, site in model.nodes.items():
             if site['type'] == 'sample':
-                model_log_probs.append(site['fn'].log_prob(site['value']))
+                log_prob = site['fn'].log_prob(site['value'])
+                if var == V.counterfactual_outcome:
+                    model_log_probs.append(log_prob)
+                else:
+                    model_log_probs.append(log_prob)
 
         guide_log_probs = []
         for site in guide.nodes.values():
@@ -97,6 +100,7 @@ class CustomELBO(pyro.infer.TraceMeanField_ELBO):
             f"KL(q({V.outcome_noise})||p({V.outcome_noise}))": kl,
         }
 
+
 class TwinNet(pl.LightningModule):
     def __init__(
         self,
@@ -109,6 +113,7 @@ class TwinNet(pl.LightningModule):
         vqvae: VQVAE,
         weight_sharing: bool = False,
         activation: ActivationFunc = 'mish',
+        sigma_decay: float = 0.99,
         batch_norm: bool = False,  # TODO remove
     ):
         super().__init__()
@@ -123,6 +128,7 @@ class TwinNet(pl.LightningModule):
             **kwargs,
             vqvae=vqvae,
             weight_sharing=weight_sharing,
+            output_type='continuous'
         )
         self.infer_noise_net = DeepTwinNetNoiseEncoder(
             **kwargs,
@@ -131,6 +137,7 @@ class TwinNet(pl.LightningModule):
         self.outcome_noise_dim = outcome_noise_dim
         self.lr = lr
         self.encoder_lr = encoder_lr
+        self.sigma_decay = sigma_decay
         self.save_hyperparameters(ignore=['vqvae'])
         self.vqvae = vqvae
 
@@ -158,6 +165,10 @@ class TwinNet(pl.LightningModule):
             loss=self.svi_loss
         )
 
+        # 0.045 & 0.05 for version 182
+        self.register_buffer('factual_scale', torch.tensor(1.0))
+        self.register_buffer('counterfactual_scale', torch.tensor(1.0))
+
     def forward(self, x) -> Tuple[Tensor, Tensor]:
         return self.twin_net(**x)
 
@@ -171,8 +182,8 @@ class TwinNet(pl.LightningModule):
         input, output = batch
         batch_size = input[V.factual_treatment].shape[0]
 
-        y = self._discrete_latent(output[V.factual_outcome])
-        y_star = self._discrete_latent(output[V.counterfactual_outcome])
+        y = output[V.factual_outcome]
+        y_star = output[V.counterfactual_outcome]
         u_y_loc = torch.zeros(self.outcome_noise_dim, device=self.device)
         u_y_scale = torch.ones(self.outcome_noise_dim, device=self.device)
 
@@ -185,14 +196,25 @@ class TwinNet(pl.LightningModule):
             input = {**input, V.outcome_noise: u_y}
             y_, y_star_ = self.twin_net.forward_probs(**input)
 
+            if self.training:
+                y_scale, y_scale_scalar = optimal_sigma(y_, y)
+                y_star_scale, y_star_scale_scalar = optimal_sigma(y_star_, y_star)
+                ema_inplace(self.factual_scale, y_scale_scalar, self.sigma_decay)
+                ema_inplace(self.counterfactual_scale, y_star_scale_scalar, self.sigma_decay)
+            else:
+                y_scale = self.factual_scale.expand_as(y)
+                y_star_scale = self.counterfactual_scale.expand_as(y_star)
+
+            self._log_optimal_sigmas(y_scale, y_star_scale)
+
             pyro.sample(
                 name=V.factual_outcome,
-                fn=Categorical(probs=y_).to_event(1),
+                fn=Normal(loc=y_, scale=y_scale).to_event(2),
                 obs=y,
             )
             pyro.sample(
                 name=V.counterfactual_outcome,
-                fn=Categorical(probs=y_star_).to_event(1),
+                fn=Normal(loc=y_star_, scale=y_star_scale).to_event(2),
                 obs=y_star,
             )
 
@@ -287,6 +309,25 @@ class TwinNet(pl.LightningModule):
         metrics = dict(loss=loss, **svi_metrics)
         return loss, metrics
 
+    def _log_optimal_sigmas(
+        self,
+        factual_sigma: Tensor,
+        counterfactual_sigma: Tensor
+    ):
+        factual_sigma_: Tensor = factual_sigma.unique()
+        counterfactual_sigma_: Tensor = counterfactual_sigma.unique()
+        assert factual_sigma_.numel() == 1
+        assert counterfactual_sigma_.numel() == 1
+        factual_sigma_scalar = factual_sigma_[0].item()
+        counterfactual_sigma_scalar = counterfactual_sigma_[0].item()
+        if hasattr(self, 'trainer') and self.trainer is not None:
+            stage = self.trainer.state.stage.value
+        else:
+            stage = 'inference'
+        self.log_dict({
+            f"{stage}/factual_sigma": factual_sigma_scalar,
+            f"{stage}/counterfactual_sigma": counterfactual_sigma_scalar,
+        })
 
 class PSFTwinNet(TwinNet):
     def __init__(

@@ -1,11 +1,13 @@
 from functools import partial
 from typing import Callable, Literal, Tuple
+from einops import rearrange
 from torch import Tensor
 import torch
 from torch import nn
 from ccbir.arch import PreActResBlock
 from ccbir.models.vqvae.model import VQVAE
 import torch.nn.functional as F
+from einops.layers.torch import Rearrange
 
 # TODO: ideally break direct dependence on VQVAE and reduce
 # hardcoding of architecture input/output sizes
@@ -24,10 +26,12 @@ class DeepTwinNet(nn.Module):
         vqvae: VQVAE,
         weight_sharing: bool,
         activation: Callable[..., nn.Module],
+        output_type: Literal['categorical', 'continuous'] = 'categorical',
     ):
         super().__init__()
         self.weight_sharing = weight_sharing
         self.vqvae = vqvae
+        self.output_type = output_type
 
         resblocks = partial(
             PreActResBlock.multi_block,
@@ -50,14 +54,27 @@ class DeepTwinNet(nn.Module):
             )
 
         def make_branch():
-            return nn.Sequential(
+            branch = [
                 resblocks(3, branch_in_channels, 32),
                 nn.Conv2d(32, 64, 3, 1, 1, bias=False),
                 nn.BatchNorm2d(64),
                 activation(),
-                nn.Conv2d(64, vqvae.codebook_size, 1),
-                nn.Softmax2d(),
-            )
+            ]
+            if output_type == 'continuous':
+                output = [
+                    nn.Conv2d(64, vqvae.latent_dim, 1),
+                    Rearrange('b d h w -> b (h w) d'),
+                ]
+            elif output_type == 'categorical':
+                output = [
+                    nn.Conv2d(64, vqvae.codebook_size, 1),
+                    nn.Softmax2d(),
+                    Rearrange('b k h w -> b (h w) k'),
+                ]
+            else:
+                raise NotImplementedError
+
+            return nn.Sequential(*branch, *output)
 
         self.shared_trunk = make_trunk()
         self.predict_y = make_branch()
@@ -80,7 +97,7 @@ class DeepTwinNet(nn.Module):
         )
 
         assert dummy_y.shape[1:] == outcome_shape, dummy_y.shape
-        assert dummy_y_star.shape[1:] == outcome_shape, dummy_y_star.shape
+        assert dummy_y_star.shape[1:] == outcome_shape, dummy_y_star.shapez
 
     def forward(
         self,
@@ -89,15 +106,29 @@ class DeepTwinNet(nn.Module):
         confounders: Tensor,
         outcome_noise: Tensor,
     ) -> Tuple[Tensor, Tensor]:
-        y_discrete, y_star_discrete = self.forward_discrete(
-            factual_treatment=factual_treatment,
-            counterfactual_treatment=counterfactual_treatment,
-            confounders=confounders,
-            outcome_noise=outcome_noise,
-        )
-        # TODO: refactor trainwrecks/stop dependening on vqvae
-        y = self.vqvae.model.vq.quantize_encoding(y_discrete)
-        y_star = self.vqvae.model.vq.quantize_encoding(y_star_discrete)
+
+        if self.output_type == 'categorical':
+            y_discrete, y_star_discrete = self.forward_discrete(
+                factual_treatment=factual_treatment,
+                counterfactual_treatment=counterfactual_treatment,
+                confounders=confounders,
+                outcome_noise=outcome_noise,
+            )
+            # TODO: refactor trainwrecks/stop dependening on vqvae
+            y = self.vqvae.model.vq.quantize_encoding(y_discrete)
+            y_star = self.vqvae.model.vq.quantize_encoding(y_star_discrete)
+
+        elif self.output_type == 'continuous':
+            y, y_star = self.forward_probs(
+                factual_treatment=factual_treatment,
+                counterfactual_treatment=counterfactual_treatment,
+                confounders=confounders,
+                outcome_noise=outcome_noise,
+            )
+            y, _, _, _ = self.vqvae.vq(y)
+            y_star, _, _, _ = self.vqvae.vq(y_star)
+        else:
+            raise NotImplementedError
 
         return y, y_star
 
@@ -115,8 +146,16 @@ class DeepTwinNet(nn.Module):
             outcome_noise=outcome_noise,
         )
 
-        y_discrete = y_probs.argmax(dim=-1)
-        y_star_discrete = y_star_probs.argmax(dim=-1)
+        if self.output_type == 'categorical':
+            y_discrete = y_probs.argmax(dim=-1)
+            y_star_discrete = y_star_probs.argmax(dim=-1)
+        elif self.output_type == 'continuous':
+            _z_q, y_discrete, _loss, _metrics = self.vqvae.vq(y_probs)
+            _z_q, y_star_discrete, _loss, _metrics = (
+                self.vqvae.vq(y_star_probs)
+            )
+        else:
+            raise NotImplementedError
 
         return y_discrete, y_star_discrete
 
@@ -149,14 +188,8 @@ class DeepTwinNet(nn.Module):
             dim=1,
         )
 
-        # pyro/pytorch distribution likes the index in the probability vector
-        # to be on the last dimension but softmax2d was applied to the
-        # channel dimentsion so make channel dimension the last one
-        factual_outcome = self.predict_y(factual_input).permute(0, 2, 3, 1)
-        counterfactual_outcome = (
-            self.predict_y_star(counterfactual_input)
-            .permute(0, 2, 3, 1)
-        )
+        factual_outcome = self.predict_y(factual_input)
+        counterfactual_outcome = self.predict_y_star(counterfactual_input)
 
         return factual_outcome, counterfactual_outcome
 
@@ -184,8 +217,8 @@ class DeepTwinNetNoiseEncoder(nn.Module):
             activation=activation,
             use_se=True,
         )
-
-        YC = outcome_shape[0]  # channels outcome
+        print(f'{outcome_shape=}')
+        YC = outcome_shape[1]  # channels outcome
         input_channels = 2 * YC  # factual + counterfactual feature map
         if include_non_descendants:
             input_channels += 2 * treatment_dim + confounders_dim
@@ -227,10 +260,18 @@ class DeepTwinNetNoiseEncoder(nn.Module):
         factual_outcome: Tensor,
         counterfactual_outcome: Tensor,
     ) -> Tensor:
-        condition_vars = [factual_outcome, counterfactual_outcome]
+        h, w = (8, 8)
+        quantized_latent_to_fmap = partial(
+            rearrange,
+            pattern='b (h w) d -> b d h w',
+            h=8,
+            w=8,
+        )
+        condition_vars = [
+            quantized_latent_to_fmap(factual_outcome),
+            quantized_latent_to_fmap(counterfactual_outcome),
+        ]
         if self.include_non_descendants:
-            height = self.outcome_shape[1]
-            width = self.outcome_shape[2]
             non_descendants = torch.cat(
                 tensors=(
                     factual_treatment,
@@ -243,7 +284,7 @@ class DeepTwinNetNoiseEncoder(nn.Module):
             non_descendants = non_descendants.view(batch_size, -1, 1, 1)
             non_descendants = F.upsample(
                 input=non_descendants,
-                size=(height, width),
+                size=(h, w),
                 mode='nearest',
             )
             condition_vars.append(non_descendants)

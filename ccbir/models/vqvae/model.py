@@ -43,7 +43,7 @@ class VQVAEComponent(nn.Module):
             nn.BatchNorm2d(64),
             activation(),
             nn.Conv2d(64, 64, 4, 1),
-            resblocks(6, 64, 64, activation=activation),
+            resblocks(4, 64, 64, activation=activation),
             nn.Conv2d(64, D, 1),
             Rearrange('b d h w -> b (h w) d'),
         )
@@ -55,10 +55,10 @@ class VQVAEComponent(nn.Module):
             accept_image_fmap=False,
             decay=0.99,
             commitment_weight=commitment_cost,
-            threshold_ema_dead_code=0.2 * 8,
+            threshold_ema_dead_code=0.05 * 8,
             inject_noise=True,
             inject_noise_sigma=1.0,
-            inject_noise_rings=8,
+            inject_noise_rings=1,
             # negative_sample_weight=0.0,
             clean_cluster_size_update=True,
             wrap_ring_noise=True,
@@ -74,7 +74,7 @@ class VQVAEComponent(nn.Module):
             nn.BatchNorm2d(64),
             activation(),
             nn.Conv2d(64, 64, 3, 1, bias=False),
-            resblocks(6, 64, 64, activation=activation),
+            resblocks(4, 64, 64, activation=activation),
             nn.Conv2d(64, C, 1),
             nn.Tanh()
         )
