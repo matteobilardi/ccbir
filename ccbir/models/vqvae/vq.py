@@ -122,6 +122,8 @@ class BasicCodebook(EuclideanCodebook):
 
     @autocast(enabled=False)
     def forward(self, x):
+        """This method has been adapted/extended starting from 
+        https://github.com/lucidrains/vector-quantize-pytorch"""
         shape, dtype = x.shape, x.dtype
         flatten = rearrange(x, '... d -> (...) d')
 
@@ -197,6 +199,8 @@ class BasicCodebook(EuclideanCodebook):
         return output
 
     def expire_codes_(self, batch_samples):
+        """This method has been adapted/extend starting from
+        https://github.com/lucidrains/vector-quantize-pytorch"""
         if self.threshold_ema_dead_code == 0:
             return
 
@@ -332,7 +336,7 @@ class Codebook(CosineSimCodebook):
 
     @autocast(enabled=False)
     def forward(self, x) -> Dict:
-        """This method is adapted from
+        """This method has been adapted/extended starting from
         https://github.com/lucidrains/vector-quantize-pytorch"""
         shape, dtype = x.shape, x.dtype
         flatten = rearrange(x, '... d -> (...) d')
@@ -565,7 +569,7 @@ class VectorQuantizer(VectorQuantize):
         self.negative_sample_weight = negative_sample_weight
 
     def forward(self, x):
-        """This method is adapted from
+        """This method has been adapted/extended starting from
         https://github.com/lucidrains/vector-quantize-pytorch"""
         shape, device, codebook_size = x.shape, x.device, self.codebook_size
 
