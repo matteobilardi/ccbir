@@ -50,6 +50,25 @@ class CustomELBO(pyro.infer.TraceMeanField_ELBO):
 
         return model_trace, guide_trace
 
+    def get_batched_elbo(
+        self,
+    ) -> Tensor:
+        model = self.trace_storage['model']
+        guide = self.trace_storage['guide']
+        model_log_probs = []
+        for var, site in model.nodes.items():
+            if site['type'] == 'sample':
+                model_log_probs.append(site['fn'].log_prob(site['value']))
+
+        guide_log_probs = []
+        for site in guide.nodes.values():
+            if site['type'] == 'sample':
+                guide_log_probs.append(site['fn'].log_prob(site['value']))
+
+        elbo = sum(model_log_probs) - sum(guide_log_probs)
+
+        return elbo
+
     def get_metrics(self) -> Dict:
         model = self.trace_storage['model']
         guide = self.trace_storage['guide']
@@ -226,6 +245,21 @@ class TwinNet(pl.LightningModule):
         test_metrics = keymap('test/'.__add__, metrics)
         self.log_dict(test_metrics, on_epoch=True)
 
+    def eval_elbo(
+        self,
+        batch: Tuple[BatchDictLike, BatchDictLike],
+        num_samples: int,
+    ) -> Tensor:
+        svi_loss = CustomELBO(num_particles=num_samples)
+        svi = pyro.infer.SVI(
+            model=self.model,
+            guide=self.guide,
+            optim=pyro.optim.Adam({}),
+            loss=svi_loss,
+        )
+        _ = svi.evaluate_loss(batch)
+        return svi_loss.get_batched_elbo()
+
     def _step(
         self,
         batch: Tuple[BatchDictLike, BatchDictLike],
@@ -268,7 +302,8 @@ class PSFTwinNet(TwinNet):
             treatment_dim=PSFTwinNetDataset.treatment_dim(),
             confounders_dim=PSFTwinNetDataset.confounders_dim(),
             # FIXME: change dataset
-            outcome_noise_dim=16,#16, #16,  # 12,  # 8,  # 16,  # 32,  # PSFTwinNetDataset.outcome_noise_dim,
+            # 16, #16,  # 12,  # 8,  # 16,  # 32,  # PSFTwinNetDataset.outcome_noise_dim,
+            outcome_noise_dim=16,
             lr=lr,
             encoder_lr=encoder_lr,
             vqvae=vqvae,
